@@ -7,7 +7,7 @@ Custom nodes for ComfyUI that provide label manipulation and text processing cap
 ### Via ComfyUI Manager (Recommended)
 
 1. Open ComfyUI Manager
-2. Search for "LabelTools"
+2. Search for "Img Label Tools"
 3. Click Install
 
 ### Manual Installation
