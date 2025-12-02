@@ -129,15 +129,19 @@ Creates organized grids/arrays of images with optional text labels. Images are f
 
 **Label Text Format:**
 Labels can be provided in multiple ways:
-- **Multiline text widget:** One label per line
+- **Multi-line labels:** Use `\n` within a label for line breaks in the text
   ```
   Image 1
-  Image 2
+  Image 2\nLine 2
   Image 3
   ```
+  This creates 3 labels, where the second label displays on two lines.
+    
 - **Semicolon-separated:** `Image 1; Image 2; Image 3`
 - **Dynamic input:** Connect string, number, or list output from another node
 - **Numbers:** Automatically formatted (decimals truncated to 5 places, trailing zeros removed)
+
+**Note:** Actual newlines (pressing Enter) separate different labels. Use `\n` (backslash-n) for line breaks within a single label.
 
 **Smart Layout Behavior:**
 Smart layouts consider the actual dimensions of images (after padding and labels) to optimize the grid arrangement:
