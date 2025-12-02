@@ -32,7 +32,7 @@ class ImageEqualizer:
     
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "equalize"
-    CATEGORY = "ImgLabelTools"
+    CATEGORY = "Image Label Tools"
     DESCRIPTION = """
 Resizes images to match the largest or smallest image among them.
 
