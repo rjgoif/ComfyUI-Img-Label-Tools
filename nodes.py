@@ -1,4 +1,22 @@
 """
+ComfyUI Image Label Tools
+Custom nodes for image processing and labeling in ComfyUI
+Inspired by
+KJNodes for ComfyUI by github user kijai
+Mikey Nodes for ComfyUI by github user bash-j
+"""
+
+import torch
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import os
+import folder_paths
+import math
+from comfy.utils import common_upscale
+
+MAX_RESOLUTION = 16384
+
+"""
 Label processing nodes for ComfyUI
 """
 
@@ -185,7 +203,11 @@ pad_color options:
                     elif pad_color == "gray":
                         color_val = "128, 128, 128"
                     elif pad_color == "average":
-                        avg = out_image.pow(2.2).mean(dim=[0, 1, 2]).pow(1/2.2)
+                        # Reshape to [pixels, 3] and take mean across pixels
+                        avg = out_image.pow(2.2).reshape(-1, 3).mean(dim=0).pow(1/2.2)
+                        # Handle NaN and clip to valid range
+                        avg = torch.nan_to_num(avg, nan=0.5)
+                        avg = torch.clamp(avg, 0.0, 1.0)
                         color_val = f"{int(avg[0]*255)}, {int(avg[1]*255)}, {int(avg[2]*255)}"
                     elif pad_color == "average_edge":
                         edge_h = max(1, int(scaled_h * 0.05))
@@ -228,10 +250,571 @@ pad_color options:
         return padded
 
 
+
+
+class ImageArray:
+    """Creates labeled image arrays in various layouts"""
+    INPUT_IS_LIST = True
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        # Check for fonts directory
+        if os.path.exists(os.path.join(folder_paths.base_path, 'fonts')):
+            cls.font_dir = os.path.join(folder_paths.base_path, 'fonts')
+            cls.font_files = [f for f in os.listdir(cls.font_dir) if os.path.isfile(os.path.join(cls.font_dir, f))]
+            font_default = cls.font_files[0] if cls.font_files else 'arial.ttf'
+        else:
+            cls.font_dir = None
+            cls.font_files = ['arial.ttf']
+            font_default = 'arial.ttf'
+        
+        return {
+            'required': {
+                'images': ('IMAGE',),
+                'background': (['white', 'black'], {'default': 'white'}),
+                'resize': (['grow', 'shrink'], {'default': 'grow'}),
+                'size_method': (['pad', 'stretch', 'crop_center', 'fill'], {'default': 'pad'}),
+                'pad': ('BOOLEAN', {'default': True}),
+                'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait'], {'default': 'square'}),
+                'labels': ('STRING', {'multiline': True, 'default': ''}),
+                'label_end': (['loop', 'end'], {'default': 'loop'}),
+                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
+                'label_size': ('INT', {'default': 32, 'min': 8, 'max': 200, 'step': 1}),
+                'font': (cls.font_files, {'default': font_default}),
+            },
+            'optional': {
+                'label_input': ('STRING', {'forceInput': True}),
+            }
+        }
+    
+    RETURN_TYPES = ('IMAGE',)
+    FUNCTION = 'create_array'
+    CATEGORY = 'Image Label Tools'
+    DESCRIPTION = "Creates an array of images with optional labels in various layouts"
+    
+    def parse_labels(self, labels_text, label_input=None):
+        """Parse labels from either input or text widget"""
+        if label_input:
+            # Handle list or single input
+            if isinstance(label_input, list):
+                labels = []
+                for item in label_input:
+                    if isinstance(item, (int, float)):
+                        labels.append(self._format_number(item))
+                    else:
+                        labels.append(str(item))
+                return labels
+            else:
+                if isinstance(label_input, (int, float)):
+                    return [self._format_number(label_input)]
+                return [str(label_input)]
+        
+        # Parse from text widget
+        if not labels_text.strip():
+            return []
+        
+        # Split by newlines first, then by semicolons
+        labels = []
+        lines = labels_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Check if line contains semicolons
+            if ';' in line:
+                for label in line.replace('; ', ';').split(';'):
+                    label = label.strip()
+                    if label:
+                        labels.append(label)
+            else:
+                labels.append(line)
+        return labels
+    
+    def _format_number(self, num):
+        """Format number, truncating decimals intelligently"""
+        if isinstance(num, int):
+            return str(num)
+        
+        # Convert to float
+        num = float(num)
+        
+        # If integer value, return as int
+        if num == int(num):
+            return str(int(num))
+        
+        # Find significant decimal places (up to 5)
+        str_num = f"{num:.5f}".rstrip('0')
+        return str_num
+    
+    def get_text_size(self, font, text):
+        """Get width and height of text"""
+        left, top, right, bottom = font.getbbox(text)
+        width = right - left
+        height = bottom - top
+        return width, height
+    
+    def calculate_label_dimensions(self, label_text, location, label_size, font_path, img_width, img_height):
+        """Calculate label dimensions without creating the actual label image"""
+        # Load font
+        try:
+            if self.font_dir:
+                font_file = os.path.join(self.font_dir, font_path)
+            else:
+                font_file = 'C:/Windows/Fonts/Arial.ttf'
+            font = ImageFont.truetype(font_file, label_size)
+        except:
+            font = ImageFont.load_default()
+        
+        is_vertical = location in ['left_vert', 'right_vert']
+        is_left_right_hor = location in ['left_hor', 'right_hor']
+        
+        # Calculate dimensions based on location
+        if is_vertical:
+            max_width = img_height
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            _, line_height = self.get_text_size(font, "Hg")
+            label_width = max(1, len(wrapped_lines)) * line_height + 30
+            label_height = img_height
+            
+        elif is_left_right_hor:
+            max_width = img_width // 2
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            _, line_height = self.get_text_size(font, "Hg")
+            
+            if label_text and wrapped_lines:
+                max_line_width = max(int(font.getlength(line)) for line in wrapped_lines if line)
+            else:
+                max_line_width = 0
+            label_width = max_line_width + 30
+            label_height = max(1, len(wrapped_lines)) * (line_height + 5) + 30
+            
+        else:  # top or bottom
+            max_width = img_width
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            _, line_height = self.get_text_size(font, "Hg")
+            label_width = img_width
+            label_height = max(1, len(wrapped_lines)) * (line_height + 5) + 30
+        
+        return label_width, label_height
+    
+    def wrap_text(self, text, font, max_width):
+        """Wrap text to fit width"""
+        wrapped_lines = []
+        for line in text.split('\n'):
+            words = line.split(' ')
+            if not words:
+                wrapped_lines.append('')
+                continue
+            
+            new_line = words[0]
+            for word in words[1:]:
+                if int(font.getlength(new_line + ' ' + word)) <= max_width:
+                    new_line += ' ' + word
+                else:
+                    wrapped_lines.append(new_line)
+                    new_line = word
+            wrapped_lines.append(new_line)
+        return wrapped_lines
+    
+    def add_label_to_image(self, image_pil, label_text, location, label_size, font_path, bg_color, text_color, fixed_label_width=None, fixed_label_height=None):
+        """Add label to a PIL image"""
+        # Always add label padding, even if text is empty
+        width, height = image_pil.size
+        
+        # Load font
+        try:
+            if self.font_dir:
+                font_file = os.path.join(self.font_dir, font_path)
+            else:
+                font_file = 'C:/Windows/Fonts/Arial.ttf'
+            font = ImageFont.truetype(font_file, label_size)
+        except:
+            font = ImageFont.load_default()
+        
+        # Determine if vertical or horizontal
+        is_vertical = location in ['left_vert', 'right_vert']
+        is_left_right_hor = location in ['left_hor', 'right_hor']
+        
+        # Calculate label dimensions
+        # Get line height for text drawing (needed in all cases)
+        _, line_height = self.get_text_size(font, "Hg")
+        
+        if fixed_label_width and fixed_label_height:
+            # Use provided fixed dimensions
+            label_width = fixed_label_width
+            label_height = fixed_label_height
+            # Still need to wrap text for drawing
+            if is_vertical:
+                max_width = height
+            elif is_left_right_hor:
+                max_width = width // 2
+            else:
+                max_width = width
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+        elif is_vertical:
+            # For vertical text, we'll rotate it
+            max_width = height
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            
+            # Create vertical label
+            label_width = max(1, len(wrapped_lines)) * line_height + 30
+            label_height = height
+            
+        elif is_left_right_hor:
+            # Horizontal text on left/right side
+            max_width = width // 2  # Max half the image width
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            
+            # Calculate actual width needed
+            if label_text and wrapped_lines:
+                max_line_width = max(int(font.getlength(line)) for line in wrapped_lines if line)
+            else:
+                max_line_width = 0
+            label_width = max_line_width + 30
+            label_height = max(1, len(wrapped_lines)) * (line_height + 5) + 30
+            
+        else:
+            # Top or bottom
+            max_width = width
+            wrapped_lines = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            
+            label_width = width
+            label_height = max(1, len(wrapped_lines)) * (line_height + 5) + 30
+        
+        # Create label image
+        label_img = Image.new('RGB', (label_width, label_height), bg_color)
+        draw = ImageDraw.Draw(label_img)
+        
+        # Draw text
+        if is_vertical:
+            # Draw text horizontally first, then rotate
+            temp_width = label_height
+            temp_height = label_width
+            temp_img = Image.new('RGB', (temp_width, temp_height), bg_color)
+            temp_draw = ImageDraw.Draw(temp_img)
+            
+            y_pos = 15
+            for line in wrapped_lines:
+                text_width = int(font.getlength(line))
+                x_pos = (temp_width - text_width) // 2
+                temp_draw.text((x_pos, y_pos), line, text_color, font=font)
+                y_pos += line_height + 5
+            
+            # Rotate 90 degrees (counterclockwise, so bottom faces image)
+            label_img = temp_img.rotate(90, expand=True)
+            
+        else:
+            # Horizontal text (top, bottom, left_hor, right_hor)
+            y_pos = 15
+            for line in wrapped_lines:
+                text_width = int(font.getlength(line))
+                x_pos = (label_width - text_width) // 2
+                draw.text((x_pos, y_pos), line, text_color, font=font)
+                y_pos += line_height + 5
+        
+        # Combine image and label based on location
+        if location == 'top':
+            combined = Image.new('RGB', (width, height + label_height), bg_color)
+            combined.paste(label_img, (0, 0))
+            combined.paste(image_pil, (0, label_height))
+        elif location == 'bottom':
+            combined = Image.new('RGB', (width, height + label_height), bg_color)
+            combined.paste(image_pil, (0, 0))
+            combined.paste(label_img, (0, height))
+        elif location in ['left_vert', 'left_hor']:
+            combined = Image.new('RGB', (width + label_width, height), bg_color)
+            # Center label vertically if needed
+            if label_height < height:
+                y_offset = (height - label_height) // 2
+                combined.paste(label_img, (0, y_offset))
+            else:
+                combined.paste(label_img, (0, 0))
+            combined.paste(image_pil, (label_width, 0))
+        else:  # right_vert, right_hor
+            combined = Image.new('RGB', (width + label_width, height), bg_color)
+            combined.paste(image_pil, (0, 0))
+            # Center label vertically if needed
+            if label_height < height:
+                y_offset = (height - label_height) // 2
+                combined.paste(label_img, (width, y_offset))
+            else:
+                combined.paste(label_img, (width, 0))
+        
+        return combined
+    
+    def resize_image(self, image_pil, target_width, target_height, method, bg_color):
+        """Resize image using specified method"""
+        if method == 'stretch':
+            return image_pil.resize((target_width, target_height), Image.LANCZOS)
+        
+        elif method == 'crop_center':
+            # Scale to fill, then crop center
+            img_ratio = image_pil.width / image_pil.height
+            target_ratio = target_width / target_height
+            
+            if img_ratio > target_ratio:
+                # Image is wider, scale by height
+                new_height = target_height
+                new_width = int(image_pil.width * (target_height / image_pil.height))
+            else:
+                # Image is taller, scale by width
+                new_width = target_width
+                new_height = int(image_pil.height * (target_width / image_pil.width))
+            
+            resized = image_pil.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Crop center
+            left = (new_width - target_width) // 2
+            top = (new_height - target_height) // 2
+            return resized.crop((left, top, left + target_width, top + target_height))
+        
+        elif method == 'fill':
+            # Scale to fill completely (may crop)
+            img_ratio = image_pil.width / image_pil.height
+            target_ratio = target_width / target_height
+            
+            if img_ratio > target_ratio:
+                new_width = target_width
+                new_height = int(image_pil.height * (target_width / image_pil.width))
+            else:
+                new_height = target_height
+                new_width = int(image_pil.width * (target_height / image_pil.height))
+            
+            return image_pil.resize((new_width, new_height), Image.LANCZOS)
+        
+        else:  # pad
+            # Scale to fit, then pad
+            img_ratio = image_pil.width / image_pil.height
+            target_ratio = target_width / target_height
+            
+            if img_ratio > target_ratio:
+                # Image is wider, scale by width
+                new_width = target_width
+                new_height = int(image_pil.height * (target_width / image_pil.width))
+            else:
+                # Image is taller, scale by height
+                new_height = target_height
+                new_width = int(image_pil.width * (target_height / image_pil.height))
+            
+            resized = image_pil.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Create padded image
+            padded = Image.new('RGB', (target_width, target_height), bg_color)
+            
+            # Paste centered
+            x_offset = (target_width - new_width) // 2
+            y_offset = (target_height - new_height) // 2
+            padded.paste(resized, (x_offset, y_offset))
+            
+            return padded
+    
+    def calculate_grid_dimensions(self, num_images, shape):
+        """Calculate grid rows and columns based on shape"""
+        if shape == 'horizontal':
+            return 1, num_images
+        elif shape == 'vertical':
+            return num_images, 1
+        elif shape == 'square':
+            side = math.ceil(math.sqrt(num_images))
+            return side, side
+        elif shape == 'smart_square':
+            # Find closest to square
+            best_rows = math.ceil(math.sqrt(num_images))
+            best_cols = math.ceil(num_images / best_rows)
+            return best_rows, best_cols
+        elif shape == 'smart_landscape':
+            # Target 3:2 ratio (landscape)
+            target_ratio = 3 / 2
+            best_diff = float('inf')
+            best_rows, best_cols = 1, num_images
+            
+            for rows in range(1, num_images + 1):
+                cols = math.ceil(num_images / rows)
+                ratio = cols / rows
+                diff = abs(ratio - target_ratio)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_rows = rows
+                    best_cols = cols
+            
+            return best_rows, best_cols
+        elif shape == 'smart_portrait':
+            # Target 2:3 ratio (portrait)
+            target_ratio = 2 / 3
+            best_diff = float('inf')
+            best_rows, best_cols = num_images, 1
+            
+            for rows in range(1, num_images + 1):
+                cols = math.ceil(num_images / rows)
+                ratio = cols / rows
+                diff = abs(ratio - target_ratio)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_rows = rows
+                    best_cols = cols
+            
+            return best_rows, best_cols
+        
+        return 1, num_images
+    
+    def create_array(self, images, background, resize, size_method, pad, shape, 
+                    labels, label_end, label_location, label_size, font, label_input=None):
+        """Create array of labeled images"""
+        # Extract parameters from lists
+        background = background[0] if isinstance(background, list) else background
+        resize = resize[0] if isinstance(resize, list) else resize
+        size_method = size_method[0] if isinstance(size_method, list) else size_method
+        pad = pad[0] if isinstance(pad, list) else pad
+        shape = shape[0] if isinstance(shape, list) else shape
+        labels = labels[0] if isinstance(labels, list) else labels
+        label_end = label_end[0] if isinstance(label_end, list) else label_end
+        label_location = label_location[0] if isinstance(label_location, list) else label_location
+        label_size = label_size[0] if isinstance(label_size, list) else label_size
+        font = font[0] if isinstance(font, list) else font
+    
+        # Convert background to RGB
+        bg_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
+        # FIXED: Label background is OPPOSITE of main background
+        label_bg = (0, 0, 0) if background == 'white' else (255, 255, 255)
+        # FIXED: Text color is OPPOSITE of label background
+        text_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
+    
+        # Parse labels
+        label_list = self.parse_labels(labels, label_input)
+    
+        # Convert tensors to PIL images
+        pil_images = []
+        for img_tensor in images:
+            # Handle batch dimension
+            if len(img_tensor.shape) == 4:
+                img_tensor = img_tensor[0]
+        
+            # Convert to numpy and then PIL
+            img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_np)
+            pil_images.append(pil_img)
+    
+        num_images = len(pil_images)
+    
+        # STEP 1: Find target dimensions for padding (BEFORE adding labels)
+        widths = [img.width for img in pil_images]
+        heights = [img.height for img in pil_images]
+    
+        if resize == 'grow':
+            target_width = max(widths)
+            target_height = max(heights)
+        else:  # shrink
+            target_width = min(widths)
+            target_height = min(heights)
+    
+        # STEP 2: Resize/pad all images to target dimensions if pad is enabled
+        if pad:
+            processed_images = []
+            for pil_img in pil_images:
+                processed = self.resize_image(pil_img, target_width, target_height, size_method, bg_color)
+                processed_images.append(processed)
+        else:
+            processed_images = pil_images
+            # Recalculate dimensions without forcing uniform size
+            widths = [img.width for img in processed_images]
+            heights = [img.height for img in processed_images]
+            target_width = max(widths)
+            target_height = max(heights)
+    
+        # STEP 3: Calculate maximum label dimensions across all images
+        # This ensures all images get the same label padding size
+        max_label_width = 0
+        max_label_height = 0
+        
+        # Get all label texts that will be used
+        label_texts_to_use = []
+        for i in range(num_images):
+            label_text = ''
+            if label_list:
+                if label_end == 'loop':
+                    label_idx = i % len(label_list)
+                    label_text = label_list[label_idx]
+                else:  # end
+                    if i < len(label_list):
+                        label_text = label_list[i]
+            label_texts_to_use.append(label_text)
+        
+        # Calculate max dimensions needed
+        for i, pil_img in enumerate(processed_images):
+            lw, lh = self.calculate_label_dimensions(
+                label_texts_to_use[i], label_location, label_size, font,
+                pil_img.width, pil_img.height
+            )
+            max_label_width = max(max_label_width, lw)
+            max_label_height = max(max_label_height, lh)
+        
+        # STEP 4: Add labels to padded images using consistent dimensions
+        labeled_images = []
+        for i, pil_img in enumerate(processed_images):
+            # Always add label padding with the max dimensions
+            pil_img = self.add_label_to_image(
+                pil_img, label_texts_to_use[i], label_location, 
+                label_size, font, label_bg, text_color,
+                fixed_label_width=max_label_width,
+                fixed_label_height=max_label_height
+            )
+            labeled_images.append(pil_img)
+    
+        # STEP 5: Calculate grid dimensions using LABELED image sizes
+        # (All images should be same size after padding + labels are uniform)
+        labeled_widths = [img.width for img in labeled_images]
+        labeled_heights = [img.height for img in labeled_images]
+        cell_width = max(labeled_widths)
+        cell_height = max(labeled_heights)
+    
+        # Calculate grid dimensions
+        rows, cols = self.calculate_grid_dimensions(num_images, shape)
+    
+        # STEP 6: Create array canvas
+        if shape in ['horizontal', 'vertical']:
+            if shape == 'horizontal':
+                canvas_width = cell_width * cols
+                canvas_height = cell_height
+            else:
+                canvas_width = cell_width
+                canvas_height = cell_height * rows
+        else:
+            canvas_width = cell_width * cols
+            canvas_height = cell_height * rows
+    
+        canvas = Image.new('RGB', (canvas_width, canvas_height), bg_color)
+    
+        # STEP 7: Place images in grid
+        for i, img in enumerate(labeled_images):
+            row = i // cols
+            col = i % cols
+        
+            x_offset = col * cell_width
+            y_offset = row * cell_height
+        
+            # Center image in cell if not perfectly sized
+            if img.width < cell_width:
+                x_offset += (cell_width - img.width) // 2
+            if img.height < cell_height:
+                y_offset += (cell_height - img.height) // 2
+        
+            canvas.paste(img, (x_offset, y_offset))
+    
+        # Convert back to tensor
+        canvas_np = np.array(canvas).astype(np.float32) / 255.0
+        canvas_tensor = torch.from_numpy(canvas_np).unsqueeze(0)
+    
+        print(f"Image Array: {num_images} images | {shape} layout | {canvas_width}x{canvas_height}")
+    
+        return (canvas_tensor,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "ImageEqualizer": ImageEqualizer,
+    'ImageEqualizer': ImageEqualizer,
+    'ImageArray': ImageArray,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageEqualizer": "Image Equalizer",
+    'ImageEqualizer': 'Image Equalizer',
+    'ImageArray': 'Image Array',
 }
