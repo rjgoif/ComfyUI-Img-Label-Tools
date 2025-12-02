@@ -1,7 +1,10 @@
 """
 ComfyUI Img Label Tools
 Custom nodes for image processing and labeling in ComfyUI
-Inspired by KJNodes for ComfyUI by github user kijai
+
+Credits:
+- Image Equalizer inspired by KJNodes for ComfyUI by github user kijai
+- Image Array label application logic inspired by Mikey Nodes by github user bash-j
 """
 
 import torch
@@ -279,6 +282,7 @@ class ImageArray:
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
                 'label_size': ('INT', {'default': 32, 'min': 8, 'max': 200, 'step': 1}),
                 'font': (cls.font_files, {'default': font_default}),
+                'spacing': ('INT', {'default': 0, 'min': 0, 'max': 100, 'step': 1}),
             },
             'optional': {
                 'label_input': ('STRING', {'forceInput': True}),
@@ -311,7 +315,10 @@ class ImageArray:
         if not labels_text.strip():
             return []
         
-        # Split by newlines first, then by semicolons
+        # Split by actual newlines (not \n strings)
+        # Replace literal \n with a placeholder first
+        labels_text = labels_text.replace('\\n', '\x00')  # Use null char as placeholder
+        
         labels = []
         lines = labels_text.split('\n')
         for line in lines:
@@ -323,9 +330,13 @@ class ImageArray:
                 for label in line.replace('; ', ';').split(';'):
                     label = label.strip()
                     if label:
+                        # Restore \n as actual newlines within the label
+                        label = label.replace('\x00', '\n')
                         labels.append(label)
             else:
-                labels.append(line)
+                # Restore \n as actual newlines within the label
+                label = line.replace('\x00', '\n')
+                labels.append(label)
         return labels
     
     def _format_number(self, num):
@@ -728,7 +739,7 @@ class ImageArray:
         return 1, num_images
     
     def create_array(self, images, background, resize, size_method, pad, shape, 
-                    labels, label_end, label_location, label_size, font, label_input=None):
+                    labels, label_end, label_location, label_size, font, spacing, label_input=None):
         """Create array of labeled images"""
         # Extract parameters from lists
         background = background[0] if isinstance(background, list) else background
@@ -741,6 +752,7 @@ class ImageArray:
         label_location = label_location[0] if isinstance(label_location, list) else label_location
         label_size = label_size[0] if isinstance(label_size, list) else label_size
         font = font[0] if isinstance(font, list) else font
+        spacing = spacing[0] if isinstance(spacing, list) else spacing
     
         # Convert background to RGB
         bg_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
@@ -748,6 +760,8 @@ class ImageArray:
         label_bg = (0, 0, 0) if background == 'white' else (255, 255, 255)
         # FIXED: Text color is OPPOSITE of label background
         text_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
+        # Spacing color is OPPOSITE of background
+        spacing_color = (0, 0, 0) if background == 'white' else (255, 255, 255)
     
         # Parse labels
         label_list = self.parse_labels(labels, label_input)
@@ -833,6 +847,19 @@ class ImageArray:
                 fixed_label_height=max_label_height
             )
             labeled_images.append(pil_img)
+    
+        # STEP 4.5: Add spacing border around each image (if spacing > 0)
+        if spacing > 0:
+            spaced_images = []
+            for pil_img in labeled_images:
+                # Create new image with spacing border
+                new_width = pil_img.width + (spacing * 2)
+                new_height = pil_img.height + (spacing * 2)
+                spaced_img = Image.new('RGB', (new_width, new_height), spacing_color)
+                # Paste original image in center
+                spaced_img.paste(pil_img, (spacing, spacing))
+                spaced_images.append(spaced_img)
+            labeled_images = spaced_images
     
         # STEP 5: Calculate grid dimensions using LABELED image sizes
         # (All images should be same size after padding + labels are uniform)
