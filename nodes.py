@@ -23,14 +23,15 @@ class ImageEqualizer:
                 "images": ("IMAGE",),
                 "size_mode": (["grow", "shrink"], {"default": "grow"}),
                 "upscale_method": (cls.upscale_methods, {"default": "bicubic"}),
-                "keep_proportion": (["pad", "stretch", "resize", "crop", "pillarbox_blur", "total_pixels"], {"default": "pad"}),
+                "keep_proportion": (["pad", "stretch", "resize", "crop", "total_pixels"], {"default": "pad"}),
                 "pad_color": (["black", "white", "gray", "average", "average_edge"], {"default": "black"}),
                 "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center"}),
-                "output": (["batch", "list"], {"default": "batch"}),
             }
         }
     
     RETURN_TYPES = ("IMAGE",)
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True,)
     FUNCTION = "equalize"
     CATEGORY = "Image Label Tools"
     DESCRIPTION = """
@@ -45,7 +46,6 @@ keep_proportion maintains aspect ratio by highest dimension:
 - stretch: directly resizes to target
 - resize: scales to fit within target
 - crop: crops to fill target
-- pillarbox_blur: pads with blurred edges
 - total_pixels: maintains total pixel count
 
 pad_color options:
@@ -56,214 +56,176 @@ pad_color options:
 - average_edge: weighted mean of peripheral 5% of pixels
 """
 
-    def equalize(self, images, size_mode, upscale_method, keep_proportion, pad_color, crop_position, output):
+    def equalize(self, images, size_mode, upscale_method, keep_proportion, pad_color, crop_position):
         from comfy.utils import common_upscale
         
-        # Convert list to batch if needed
-        if isinstance(images, list):
-            images = torch.cat(images, dim=0)
+        # When INPUT_IS_LIST=True, all parameters come as lists - extract the first value
+        size_mode = size_mode[0] if isinstance(size_mode, list) else size_mode
+        upscale_method = upscale_method[0] if isinstance(upscale_method, list) else upscale_method
+        keep_proportion = keep_proportion[0] if isinstance(keep_proportion, list) else keep_proportion
+        pad_color = pad_color[0] if isinstance(pad_color, list) else pad_color
+        crop_position = crop_position[0] if isinstance(crop_position, list) else crop_position
         
-        B, H, W, C = images.shape
         device = torch.device("cpu")
         
-        # Determine target dimensions based on size_mode
-        if size_mode == "grow":
-            target_width = W
-            target_height = H
-            for i in range(B):
-                target_width = max(target_width, images[i].shape[1])
-                target_height = max(target_height, images[i].shape[0])
-        else:  # shrink
-            target_width = W
-            target_height = H
-            for i in range(B):
-                target_width = min(target_width, images[i].shape[1])
-                target_height = min(target_height, images[i].shape[0])
+        # Collect all individual images
+        all_images = []
+        if isinstance(images, list):
+            for batch in images:
+                for i in range(batch.shape[0]):
+                    all_images.append(batch[i:i+1])
+        else:
+            for i in range(images.shape[0]):
+                all_images.append(images[i:i+1])
         
-        processed_images = []
+        num_images = len(all_images)
         
-        for i in range(B):
-            img = images[i:i+1]
+        # Find target dimensions
+        target_height = all_images[0].shape[1]
+        target_width = all_images[0].shape[2]
+        
+        for img in all_images:
+            h, w = img.shape[1], img.shape[2]
+            if size_mode == "grow":
+                target_height = max(target_height, h)
+                target_width = max(target_width, w)
+            else:  # shrink
+                target_height = min(target_height, h)
+                target_width = min(target_width, w)
+        
+        print(f"Image Equalizer: {num_images} images | {size_mode} to {target_width}x{target_height} | method: {keep_proportion}")
+        
+        # Process each image
+        processed = []
+        
+        for idx, img in enumerate(all_images):
             img_h, img_w = img.shape[1], img.shape[2]
             
             # Skip if already correct size
             if img_w == target_width and img_h == target_height:
-                processed_images.append(img)
+                processed.append(img.cpu())
                 continue
             
-            width = target_width
-            height = target_height
-            pillarbox_blur = keep_proportion == "pillarbox_blur"
-            
-            # Initialize padding variables
-            pad_left = pad_right = pad_top = pad_bottom = 0
-            
-            if keep_proportion in ["resize", "total_pixels", "pad", "pillarbox_blur"]:
-                if keep_proportion == "total_pixels":
-                    total_pixels = width * height
-                    aspect_ratio = img_w / img_h
-                    new_height = int(math.sqrt(total_pixels / aspect_ratio))
-                    new_width = int(math.sqrt(total_pixels * aspect_ratio))
-                else:
-                    ratio = min(width / img_w, height / img_h)
-                    new_width = round(img_w * ratio)
-                    new_height = round(img_h * ratio)
-                
-                if keep_proportion in ["pad", "pillarbox_blur"]:
-                    # Calculate padding based on position
-                    if crop_position == "center":
-                        pad_left = (width - new_width) // 2
-                        pad_right = width - new_width - pad_left
-                        pad_top = (height - new_height) // 2
-                        pad_bottom = height - new_height - pad_top
-                    elif crop_position == "top":
-                        pad_left = (width - new_width) // 2
-                        pad_right = width - new_width - pad_left
-                        pad_top = 0
-                        pad_bottom = height - new_height
-                    elif crop_position == "bottom":
-                        pad_left = (width - new_width) // 2
-                        pad_right = width - new_width - pad_left
-                        pad_top = height - new_height
-                        pad_bottom = 0
-                    elif crop_position == "left":
-                        pad_left = 0
-                        pad_right = width - new_width
-                        pad_top = (height - new_height) // 2
-                        pad_bottom = height - new_height - pad_top
-                    elif crop_position == "right":
-                        pad_left = width - new_width
-                        pad_right = 0
-                        pad_top = (height - new_height) // 2
-                        pad_bottom = height - new_height - pad_top
-                
-                width = new_width
-                height = new_height
-            
-            # Move to device
             out_image = img.to(device)
             
-            # Crop logic
-            if keep_proportion == "crop":
-                old_height = out_image.shape[1]
-                old_width = out_image.shape[2]
-                old_aspect = old_width / old_height
-                new_aspect = target_width / target_height
+            if keep_proportion == "stretch":
+                # Direct resize to target
+                out_image = common_upscale(out_image.movedim(-1, 1), target_width, target_height, upscale_method, crop="disabled").movedim(1, -1)
+            
+            elif keep_proportion == "crop":
+                # Crop to aspect ratio then resize
+                target_aspect = target_width / target_height
+                img_aspect = img_w / img_h
                 
-                if old_aspect > new_aspect:
-                    crop_w = round(old_height * new_aspect)
-                    crop_h = old_height
+                if img_aspect > target_aspect:
+                    crop_w = int(img_h * target_aspect)
+                    crop_h = img_h
                 else:
-                    crop_w = old_width
-                    crop_h = round(old_width / new_aspect)
+                    crop_w = img_w
+                    crop_h = int(img_w / target_aspect)
                 
-                if crop_position == "center":
-                    x = (old_width - crop_w) // 2
-                    y = (old_height - crop_h) // 2
-                elif crop_position == "top":
-                    x = (old_width - crop_w) // 2
+                x = (img_w - crop_w) // 2
+                y = (img_h - crop_h) // 2
+                
+                if crop_position == "top":
                     y = 0
                 elif crop_position == "bottom":
-                    x = (old_width - crop_w) // 2
-                    y = old_height - crop_h
+                    y = img_h - crop_h
                 elif crop_position == "left":
                     x = 0
-                    y = (old_height - crop_h) // 2
                 elif crop_position == "right":
-                    x = old_width - crop_w
-                    y = (old_height - crop_h) // 2
+                    x = img_w - crop_w
                 
                 out_image = out_image[:, y:y+crop_h, x:x+crop_w, :]
+                out_image = common_upscale(out_image.movedim(-1, 1), target_width, target_height, upscale_method, crop="disabled").movedim(1, -1)
             
-            # Resize
-            out_image = common_upscale(out_image.movedim(-1, 1), width, height, upscale_method, crop="disabled").movedim(1, -1)
-            
-            # Padding logic
-            if (keep_proportion in ["pad", "pillarbox_blur"]) and (pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0):
-                # Calculate pad color
-                if pad_color == "black":
-                    color_value = "0, 0, 0"
-                elif pad_color == "white":
-                    color_value = "255, 255, 255"
-                elif pad_color == "gray":
-                    color_value = "128, 128, 128"
-                elif pad_color == "average":
-                    # Gamma-corrected average of entire image
-                    avg = out_image.pow(2.2).mean(dim=[0, 1, 2]).pow(1/2.2)
-                    color_value = f"{int(avg[0]*255)}, {int(avg[1]*255)}, {int(avg[2]*255)}"
-                elif pad_color == "average_edge":
-                    # Average of peripheral 5% of pixels
-                    edge_h = max(1, int(height * 0.05))
-                    edge_w = max(1, int(width * 0.05))
-                    
-                    top_edge = out_image[:, :edge_h, :, :]
-                    bottom_edge = out_image[:, -edge_h:, :, :]
-                    left_edge = out_image[:, :, :edge_w, :]
-                    right_edge = out_image[:, :, -edge_w:, :]
-                    
-                    edge_pixels = torch.cat([top_edge, bottom_edge, left_edge, right_edge], dim=1)
-                    avg = edge_pixels.pow(2.2).mean(dim=[0, 1, 2]).pow(1/2.2)
-                    color_value = f"{int(avg[0]*255)}, {int(avg[1]*255)}, {int(avg[2]*255)}"
+            else:  # pad, resize, pillarbox_blur, total_pixels
+                # Calculate scaled size
+                if keep_proportion == "total_pixels":
+                    total_pixels = target_width * target_height
+                    aspect = img_w / img_h
+                    scaled_h = int(math.sqrt(total_pixels / aspect))
+                    scaled_w = int(math.sqrt(total_pixels * aspect))
+                else:
+                    ratio = min(target_width / img_w, target_height / img_h)
+                    scaled_w = int(img_w * ratio)
+                    scaled_h = int(img_h * ratio)
                 
-                pad_mode = "pillarbox_blur" if pillarbox_blur else "color"
+                # Resize to scaled size
+                out_image = common_upscale(out_image.movedim(-1, 1), scaled_w, scaled_h, upscale_method, crop="disabled").movedim(1, -1)
                 
-                # Apply padding
-                out_image = self._apply_padding(out_image, pad_left, pad_right, pad_top, pad_bottom, color_value, pad_mode)
+                # Pad if needed
+                if keep_proportion == "pad" and (scaled_w != target_width or scaled_h != target_height):
+                    pad_w = target_width - scaled_w
+                    pad_h = target_height - scaled_h
+                    
+                    pad_left = pad_w // 2
+                    pad_right = pad_w - pad_left
+                    pad_top = pad_h // 2
+                    pad_bottom = pad_h - pad_top
+                    
+                    if crop_position == "top":
+                        pad_bottom += pad_top
+                        pad_top = 0
+                    elif crop_position == "bottom":
+                        pad_top += pad_bottom
+                        pad_bottom = 0
+                    elif crop_position == "left":
+                        pad_right += pad_left
+                        pad_left = 0
+                    elif crop_position == "right":
+                        pad_left += pad_right
+                        pad_right = 0
+                    
+                    # Get pad color
+                    if pad_color == "black":
+                        color_val = "0, 0, 0"
+                    elif pad_color == "white":
+                        color_val = "255, 255, 255"
+                    elif pad_color == "gray":
+                        color_val = "128, 128, 128"
+                    elif pad_color == "average":
+                        avg = out_image.pow(2.2).mean(dim=[0, 1, 2]).pow(1/2.2)
+                        color_val = f"{int(avg[0]*255)}, {int(avg[1]*255)}, {int(avg[2]*255)}"
+                    elif pad_color == "average_edge":
+                        edge_h = max(1, int(scaled_h * 0.05))
+                        edge_w = max(1, int(scaled_w * 0.05))
+                        # Get edge pixels and reshape them to combine
+                        top = out_image[:, :edge_h, :, :].reshape(-1, 3)
+                        bottom = out_image[:, -edge_h:, :, :].reshape(-1, 3)
+                        left = out_image[:, :, :edge_w, :].reshape(-1, 3)
+                        right = out_image[:, :, -edge_w:, :].reshape(-1, 3)
+                        all_edges = torch.cat([top, bottom, left, right], dim=0)
+                        avg = all_edges.pow(2.2).mean(dim=0).pow(1/2.2)
+                        color_val = f"{int(avg[0]*255)}, {int(avg[1]*255)}, {int(avg[2]*255)}"
+                    
+                    out_image = self._apply_padding(out_image, pad_left, pad_right, pad_top, pad_bottom, color_val, "color")
             
-            processed_images.append(out_image.cpu())
+            processed.append(out_image.cpu())
         
-        # Combine results
-        result = torch.cat(processed_images, dim=0)
-        
-        # Convert to list if requested
-        if output == "list":
-            result = [result[i:i+1] for i in range(result.shape[0])]
-        
-        return (result,)
+        # When INPUT_IS_LIST=True, always return a list
+        return (processed,)
     
     def _apply_padding(self, image, pad_left, pad_right, pad_top, pad_bottom, color_value, pad_mode):
         """Apply padding to image"""
         B, H, W, C = image.shape
         
-        if pad_mode == "color":
-            # Parse color value
-            rgb = [int(x.strip()) / 255.0 for x in color_value.split(',')]
-            
-            # Create padded image
-            new_h = H + pad_top + pad_bottom
-            new_w = W + pad_left + pad_right
-            padded = torch.zeros((B, new_h, new_w, C), device=image.device)
-            
-            # Fill with color
-            for c in range(C):
-                padded[:, :, :, c] = rgb[c]
-            
-            # Place original image
-            padded[:, pad_top:pad_top+H, pad_left:pad_left+W, :] = image
-            
-            return padded
+        # Parse color value
+        rgb = [int(x.strip()) / 255.0 for x in color_value.split(',')]
         
-        elif pad_mode == "pillarbox_blur":
-            from comfy.utils import common_upscale
-            
-            # Create blurred background
-            new_h = H + pad_top + pad_bottom
-            new_w = W + pad_left + pad_right
-            
-            # Downscale then upscale for blur effect
-            blur_scale = 0.1
-            blur_h = max(1, int(H * blur_scale))
-            blur_w = max(1, int(W * blur_scale))
-            
-            blurred = common_upscale(image.movedim(-1, 1), blur_w, blur_h, "bilinear", crop="disabled")
-            blurred = common_upscale(blurred, new_w, new_h, "bilinear", crop="disabled").movedim(1, -1)
-            
-            # Place sharp image on top
-            blurred[:, pad_top:pad_top+H, pad_left:pad_left+W, :] = image
-            
-            return blurred
+        # Create padded image
+        new_h = H + pad_top + pad_bottom
+        new_w = W + pad_left + pad_right
+        padded = torch.zeros((B, new_h, new_w, C), device=image.device)
         
-        return image
+        # Fill with color
+        for c in range(C):
+            padded[:, :, :, c] = rgb[c]
+        
+        # Place original image
+        padded[:, pad_top:pad_top+H, pad_left:pad_left+W, :] = image
+        
+        return padded
 
 
 NODE_CLASS_MAPPINGS = {
