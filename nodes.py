@@ -1,9 +1,7 @@
 """
-ComfyUI Image Label Tools
+ComfyUI Img Label Tools
 Custom nodes for image processing and labeling in ComfyUI
-Inspired by
-KJNodes for ComfyUI by github user kijai
-Mikey Nodes for ComfyUI by github user bash-j
+Inspired by KJNodes for ComfyUI by github user kijai
 """
 
 import torch
@@ -493,22 +491,42 @@ class ImageArray:
             temp_img = Image.new('RGB', (temp_width, temp_height), bg_color)
             temp_draw = ImageDraw.Draw(temp_img)
             
-            y_pos = 15
+            # For vertical text, align to bottom (closest to image)
+            # Calculate total text height
+            total_text_height = sum(line_height + 5 for _ in wrapped_lines) - 5
+            y_pos = temp_height - total_text_height - 15  # Start from bottom minus padding
+            
             for line in wrapped_lines:
                 text_width = int(font.getlength(line))
-                x_pos = (temp_width - text_width) // 2
+                x_pos = (temp_width - text_width) // 2  # Horizontal center
                 temp_draw.text((x_pos, y_pos), line, text_color, font=font)
                 y_pos += line_height + 5
             
-            # Rotate 90 degrees (counterclockwise, so bottom faces image)
-            label_img = temp_img.rotate(90, expand=True)
+            # Rotate based on side
+            if location == 'left_vert':
+                # 90 degrees counterclockwise - bottom of text faces right (toward image)
+                label_img = temp_img.rotate(90, expand=True)
+            else:  # right_vert
+                # 270 degrees counterclockwise (or 90 clockwise) - bottom faces left (toward image)
+                label_img = temp_img.rotate(270, expand=True)
             
         else:
             # Horizontal text (top, bottom, left_hor, right_hor)
-            y_pos = 15
+            if location == 'top':
+                # Align to bottom (closest to image)
+                total_text_height = sum(line_height + 5 for _ in wrapped_lines) - 5
+                y_pos = label_height - total_text_height - 15
+            elif location == 'bottom':
+                # Align to top (closest to image)
+                y_pos = 15
+            else:  # left_hor, right_hor
+                # Vertically center
+                total_text_height = sum(line_height + 5 for _ in wrapped_lines) - 5
+                y_pos = (label_height - total_text_height) // 2
+            
             for line in wrapped_lines:
                 text_width = int(font.getlength(line))
-                x_pos = (label_width - text_width) // 2
+                x_pos = (label_width - text_width) // 2  # Horizontal center
                 draw.text((x_pos, y_pos), line, text_color, font=font)
                 y_pos += line_height + 5
         
@@ -608,50 +626,102 @@ class ImageArray:
             
             return padded
     
-    def calculate_grid_dimensions(self, num_images, shape):
+    def calculate_grid_dimensions(self, num_images, shape, cell_width=None, cell_height=None):
         """Calculate grid rows and columns based on shape"""
         if shape == 'horizontal':
             return 1, num_images
         elif shape == 'vertical':
             return num_images, 1
         elif shape == 'square':
+            # Find closest to square without blank rows
             side = math.ceil(math.sqrt(num_images))
-            return side, side
+            rows = side
+            cols = math.ceil(num_images / rows)
+            return rows, cols
         elif shape == 'smart_square':
-            # Find closest to square
-            best_rows = math.ceil(math.sqrt(num_images))
-            best_cols = math.ceil(num_images / best_rows)
-            return best_rows, best_cols
+            # Consider actual image dimensions for aspect ratio
+            if cell_width and cell_height:
+                # Calculate what grid dimensions best approximate a square canvas
+                target_ratio = 1.0  # Square
+                best_diff = float('inf')
+                best_rows, best_cols = 1, num_images
+                
+                for rows in range(1, num_images + 1):
+                    cols = math.ceil(num_images / rows)
+                    # Calculate canvas aspect ratio with these dimensions
+                    canvas_width = cols * cell_width
+                    canvas_height = rows * cell_height
+                    canvas_ratio = canvas_width / canvas_height
+                    diff = abs(canvas_ratio - target_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows = rows
+                        best_cols = cols
+                
+                return best_rows, best_cols
+            else:
+                # Fallback if dimensions not provided
+                best_rows = math.ceil(math.sqrt(num_images))
+                best_cols = math.ceil(num_images / best_rows)
+                return best_rows, best_cols
         elif shape == 'smart_landscape':
-            # Target 3:2 ratio (landscape)
+            # Target 3:2 ratio (landscape) considering actual image dimensions
             target_ratio = 3 / 2
             best_diff = float('inf')
             best_rows, best_cols = 1, num_images
             
-            for rows in range(1, num_images + 1):
-                cols = math.ceil(num_images / rows)
-                ratio = cols / rows
-                diff = abs(ratio - target_ratio)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_rows = rows
-                    best_cols = cols
+            if cell_width and cell_height:
+                for rows in range(1, num_images + 1):
+                    cols = math.ceil(num_images / rows)
+                    # Calculate canvas aspect ratio
+                    canvas_width = cols * cell_width
+                    canvas_height = rows * cell_height
+                    canvas_ratio = canvas_width / canvas_height
+                    diff = abs(canvas_ratio - target_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows = rows
+                        best_cols = cols
+            else:
+                # Fallback: use number of images
+                for rows in range(1, num_images + 1):
+                    cols = math.ceil(num_images / rows)
+                    ratio = cols / rows
+                    diff = abs(ratio - target_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows = rows
+                        best_cols = cols
             
             return best_rows, best_cols
         elif shape == 'smart_portrait':
-            # Target 2:3 ratio (portrait)
+            # Target 2:3 ratio (portrait) considering actual image dimensions
             target_ratio = 2 / 3
             best_diff = float('inf')
             best_rows, best_cols = num_images, 1
             
-            for rows in range(1, num_images + 1):
-                cols = math.ceil(num_images / rows)
-                ratio = cols / rows
-                diff = abs(ratio - target_ratio)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_rows = rows
-                    best_cols = cols
+            if cell_width and cell_height:
+                for rows in range(1, num_images + 1):
+                    cols = math.ceil(num_images / rows)
+                    # Calculate canvas aspect ratio
+                    canvas_width = cols * cell_width
+                    canvas_height = rows * cell_height
+                    canvas_ratio = canvas_width / canvas_height
+                    diff = abs(canvas_ratio - target_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows = rows
+                        best_cols = cols
+            else:
+                # Fallback: use number of images
+                for rows in range(1, num_images + 1):
+                    cols = math.ceil(num_images / rows)
+                    ratio = cols / rows
+                    diff = abs(ratio - target_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows = rows
+                        best_cols = cols
             
             return best_rows, best_cols
         
@@ -685,14 +755,18 @@ class ImageArray:
         # Convert tensors to PIL images
         pil_images = []
         for img_tensor in images:
-            # Handle batch dimension
+            # Handle batch dimension - extract ALL images from batch
             if len(img_tensor.shape) == 4:
-                img_tensor = img_tensor[0]
-        
-            # Convert to numpy and then PIL
-            img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
-            pil_img = Image.fromarray(img_np)
-            pil_images.append(pil_img)
+                # Tensor is [B, H, W, C] - iterate through batch
+                for b in range(img_tensor.shape[0]):
+                    img_np = (img_tensor[b].cpu().numpy() * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_np)
+                    pil_images.append(pil_img)
+            else:
+                # Tensor is [H, W, C] - single image
+                img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+                pil_img = Image.fromarray(img_np)
+                pil_images.append(pil_img)
     
         num_images = len(pil_images)
     
@@ -767,8 +841,8 @@ class ImageArray:
         cell_width = max(labeled_widths)
         cell_height = max(labeled_heights)
     
-        # Calculate grid dimensions
-        rows, cols = self.calculate_grid_dimensions(num_images, shape)
+        # Calculate grid dimensions using cell dimensions for smart layouts
+        rows, cols = self.calculate_grid_dimensions(num_images, shape, cell_width, cell_height)
     
         # STEP 6: Create array canvas
         if shape in ['horizontal', 'vertical']:
