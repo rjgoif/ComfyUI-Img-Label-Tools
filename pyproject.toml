@@ -1,0 +1,13 @@
+[project]
+name = "ComfyUI-Img-Label-Tools"
+version = "1.0.0"
+description = "A collection of ComfyUI nodes to help clearly annotate your images. "
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/rjgoif/ComfyUI-Img-Label-Tools"
+
+[tool.comfy]
+# FOLDER should be the folder your nodes live in
+package = "ComfyUI-Img-Label-Tools"
