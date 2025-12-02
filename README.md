@@ -58,9 +58,9 @@ Equalizes multiple images to matching dimensions by either growing all images to
 - `images` - Batch or list of equalized images (all same dimensions)
 
 **Use Cases:**
-- Prepare images for batch processing
-- Create uniform image sets for training data
-- Normalize mixed-size images from different sources
+- Prepare images for array display (primary use)
+- Prepare images for batch processing without losing data
+- Create uniform image sets for training data (one of many nodes that can)
 
 ---
 
