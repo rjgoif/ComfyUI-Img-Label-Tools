@@ -1,0 +1,2 @@
+# No external dependencies required beyond ComfyUI
+# Add dependencies here as needed
