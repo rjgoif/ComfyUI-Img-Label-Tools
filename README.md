@@ -36,22 +36,15 @@ Equalizes multiple images to matching dimensions by either growing all images to
 - `images` - List or batch of images to equalize
 
 **Parameters:**
-- `size_mode` - How to determine target dimensions:
-  - `grow` - Scale all images up to match the largest dimensions
-  - `shrink` - Scale all images down to match the smallest dimensions
+- `size_mode` - Either shrinking all large imgages or growing smaller images up.
 - `upscale_method` - Scaling algorithm (`nearest-exact`, `bilinear`, `area`, `bicubic`, `lanczos`)
 - `keep_proportion` - How to handle aspect ratios:
   - `pad` - Add padding to maintain aspect ratio (default)
   - `stretch` - Stretch to fill target size
-  - `resize` - Scale to fit within target
+  - `resize` - Scale to fit within target (results may not all be the same size, but will fit in a bounding box)
   - `crop` - Crop to fill target
-  - `total_pixels` - Maintain total pixel count
-- `pad_color` - Color for padding:
-  - `black` - RGB(0,0,0)
-  - `white` - RGB(255,255,255)
-  - `gray` - RGB(128,128,128)
-  - `average` - Gamma-corrected weighted mean color of entire image
-  - `average_edge` - Weighted mean of peripheral 5% of pixels
+  - `total_pixels` - Maintain total pixel count (results may not all be the same size, will depend on aspect ratio)
+- `pad_color` - Color for padding: black, white, gray, a weighted mean of all colors in the image, or just of the edge of the image. 
 - `crop_position` - Position for cropping (`center`, `top`, `bottom`, `left`, `right`)
 
 **Outputs:**
@@ -77,15 +70,9 @@ Creates organized grids/arrays of images with optional text labels. Images are f
 **Parameters:**
 
 **Layout & Sizing:**
-- `background` - Canvas background color (`white`, `black`)
-- `resize` - How to normalize image sizes:
-  - `grow` - Scale all up to largest dimensions
-  - `shrink` - Scale all down to smallest dimensions
-- `size_method` - Resizing approach:
-  - `pad` - Scale to fit, add padding (maintains aspect ratio)
-  - `stretch` - Stretch to fill
-  - `crop_center` - Scale to fill, crop excess from center
-  - `fill` - Scale to cover entire area
+- `background` - Decides the pad color and text color, and the opposite color will be used for label backgrounds
+- `resize` - Either shrinking all large imgages or growing smaller images up. Images have to fit together in the array...
+- `size_method` - Resizing approach, as above. Will only come into play if you have different sized inputs. 
 - `pad` - Enable/disable uniform sizing (boolean)
 - `shape` - Array layout:
   - `horizontal` - Single row
@@ -97,35 +84,18 @@ Creates organized grids/arrays of images with optional text labels. Images are f
 
 **Labels:**
 - `labels` - Multiline text box for labels (one per line, or semicolon-separated)
-- `label_end` - Behavior when labels run out:
-  - `loop` - Wrap around to first label
-  - `end` - No label for remaining images (empty padding still added)
-- `label_location` - Where to place labels:
-  - `top` - Above image (text bottom-aligned)
-  - `bottom` - Below image (text top-aligned)
-  - `left_vert` - Left of image, vertical text rotated 90° (bottom faces right)
-  - `left_hor` - Left of image, horizontal text (vertically centered)
-  - `right_vert` - Right of image, vertical text rotated 270° (bottom faces left)
-  - `right_hor` - Right of image, horizontal text (vertically centered)
+- `label_end` - If more imaages than labels, what to do? Either start over with repeats or just stop 
+- `label_location` - Where to place labels.
 - `label_size` - Font size in pixels (8-200, default 32)
 - `font` - Font selection from ComfyUI/fonts directory (falls back to Arial)
 
 **Spacing:**
 - `spacing` - Pixel border around each image (0-100, default 0)
-  - Color is opposite of background for contrast
+  - Color is background color for contrast against labels
   - Applied after all processing (labels, padding, etc.)
 
 **Outputs:**
 - `image` - Single combined image containing the complete array
-
-**Processing Order:**
-1. Convert inputs to PIL images (handles both lists and batches)
-2. Equalize image sizes (resize/pad based on settings)
-3. Calculate maximum label dimensions across all images
-4. Add labels with consistent dimensions to all images
-5. Add spacing border (if enabled)
-6. Calculate optimal grid layout (for smart modes, considers actual image dimensions)
-7. Create canvas and place images in grid
 
 **Label Text Format:**
 Labels can be provided in multiple ways:
@@ -143,13 +113,6 @@ Labels can be provided in multiple ways:
 
 **Note:** Actual newlines (pressing Enter) separate different labels. Use `\n` (backslash-n) for line breaks within a single label.
 
-**Smart Layout Behavior:**
-Smart layouts consider the actual dimensions of images (after padding and labels) to optimize the grid arrangement:
-- **Example:** 6 tall images (400×1200 each after labels)
-  - Regular `square`: Might arrange as 2×3 (canvas 800×3600)
-  - `smart_square`: Arranges as 3×2 (canvas 1200×2400) - closer to 1:1 aspect ratio
-  
-This ensures the final canvas has the desired proportions regardless of individual image shapes.
 
 **Use Cases:**
 - Create contact sheets or image galleries
@@ -161,36 +124,7 @@ This ensures the final canvas has the desired proportions regardless of individu
 ---
 
 ## Examples
-
-### Image Equalizer
-```
-Input: 5 images with various sizes (800×600, 1920×1080, 640×480, 1024×768, 1280×720)
-
-Settings:
-- size_mode: grow
-- keep_proportion: pad
-- pad_color: black
-
-Output: 5 images all sized 1920×1080 with black padding to maintain aspect ratios
-```
-
-### Image Array
-```
-Input: 12 product images of different sizes
-
-Settings:
-- background: white
-- resize: grow
-- size_method: pad
-- shape: smart_square
-- labels: "Product A\nProduct B\n..." (12 labels)
-- label_location: bottom
-- label_size: 24
-- spacing: 10
-
-Output: Single image with 4×3 grid (optimized for square canvas), each product labeled at bottom, 
-        with 10px black borders separating images
-```
+Eventually...
 
 ## Requirements
 
