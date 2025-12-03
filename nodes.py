@@ -760,8 +760,8 @@ class ImageArray:
         label_bg = (0, 0, 0) if background == 'white' else (255, 255, 255)
         # FIXED: Text color is OPPOSITE of label background
         text_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
-        # Spacing color is OPPOSITE of background
-        spacing_color = (0, 0, 0) if background == 'white' else (255, 255, 255)
+        # Spacing color is OPPOSITE of label background
+        spacing_color = (255, 255, 255) if background == 'white' else (0, 0, 0)
     
         # Parse labels
         label_list = self.parse_labels(labels, label_input)
