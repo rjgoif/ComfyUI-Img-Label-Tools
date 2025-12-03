@@ -118,6 +118,11 @@ Labels can be provided in multiple ways:
 
 ---
 
+### Random Subset
+Selects a random subset from newline-delimited text. Supports sampling with/without replacement, optional randomization of output order, and configurable delimiters. Returns the subset as a string list, merged string, and list of indices.
+
+---
+
 ## Examples
 Eventually...
 
