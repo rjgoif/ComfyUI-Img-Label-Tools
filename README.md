@@ -90,9 +90,7 @@ Creates organized grids/arrays of images with optional text labels. Images are f
 - `font` - Font selection from ComfyUI/fonts directory (falls back to Arial)
 
 **Spacing:**
-- `spacing` - Pixel border around each image (0-100, default 0)
-  - Color is background color for contrast against labels
-  - Applied after all processing (labels, padding, etc.)
+- `spacing` - Pixel border around each image (0-100, default 0), high contrast
 
 **Outputs:**
 - `image` - Single combined image containing the complete array
@@ -115,11 +113,8 @@ Labels can be provided in multiple ways:
 
 
 **Use Cases:**
-- Create contact sheets or image galleries
-- Generate labeled comparison grids
-- Build training data visualizations
-- Create annotated image catalogs
-- Make presentation-ready image arrays
+- Image galleries/comparisons (for Reddit, etc)
+- Manual XYZ stuff.
 
 ---
 
