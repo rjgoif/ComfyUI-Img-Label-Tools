@@ -1,0 +1,7 @@
+{
+  "name": "Img Label Tools",
+  "version": "1.0.0",
+  "description": "tools to help annotate images for sharing",
+  "author": "rjgoif",
+  "tags": ["labels", "image grids", "image arrays"]
+}
