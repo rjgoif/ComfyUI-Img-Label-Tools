@@ -23,6 +23,7 @@ Label processing nodes for ComfyUI
 
 import torch
 import math
+import random
 
 MAX_RESOLUTION = 16384
 
@@ -280,7 +281,7 @@ class ImageArray:
                 'labels': ('STRING', {'multiline': True, 'default': ''}),
                 'label_end': (['loop', 'end'], {'default': 'loop'}),
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
-                'label_size': ('INT', {'default': 32, 'min': 8, 'max': 200, 'step': 1}),
+                'label_size': ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1}),
                 'font': (cls.font_files, {'default': font_default}),
                 'spacing': ('INT', {'default': 0, 'min': 0, 'max': 100, 'step': 1}),
             },
@@ -814,38 +815,44 @@ class ImageArray:
         max_label_width = 0
         max_label_height = 0
         
-        # Get all label texts that will be used
-        label_texts_to_use = []
-        for i in range(num_images):
-            label_text = ''
-            if label_list:
-                if label_end == 'loop':
-                    label_idx = i % len(label_list)
-                    label_text = label_list[label_idx]
-                else:  # end
-                    if i < len(label_list):
-                        label_text = label_list[i]
-            label_texts_to_use.append(label_text)
-        
-        # Calculate max dimensions needed
-        for i, pil_img in enumerate(processed_images):
-            lw, lh = self.calculate_label_dimensions(
-                label_texts_to_use[i], label_location, label_size, font,
-                pil_img.width, pil_img.height
-            )
-            max_label_width = max(max_label_width, lw)
-            max_label_height = max(max_label_height, lh)
+        # Skip label calculations if label_size is 0
+        if label_size > 0:
+            # Get all label texts that will be used
+            label_texts_to_use = []
+            for i in range(num_images):
+                label_text = ''
+                if label_list:
+                    if label_end == 'loop':
+                        label_idx = i % len(label_list)
+                        label_text = label_list[label_idx]
+                    else:  # end
+                        if i < len(label_list):
+                            label_text = label_list[i]
+                label_texts_to_use.append(label_text)
+            
+            # Calculate max dimensions needed
+            for i, pil_img in enumerate(processed_images):
+                lw, lh = self.calculate_label_dimensions(
+                    label_texts_to_use[i], label_location, label_size, font,
+                    pil_img.width, pil_img.height
+                )
+                max_label_width = max(max_label_width, lw)
+                max_label_height = max(max_label_height, lh)
+        else:
+            # No labels, so create empty label list
+            label_texts_to_use = [''] * num_images
         
         # STEP 4: Add labels to padded images using consistent dimensions
         labeled_images = []
         for i, pil_img in enumerate(processed_images):
-            # Always add label padding with the max dimensions
-            pil_img = self.add_label_to_image(
-                pil_img, label_texts_to_use[i], label_location, 
-                label_size, font, label_bg, text_color,
-                fixed_label_width=max_label_width,
-                fixed_label_height=max_label_height
-            )
+            # Only add label padding if label_size > 0
+            if label_size > 0:
+                pil_img = self.add_label_to_image(
+                    pil_img, label_texts_to_use[i], label_location, 
+                    label_size, font, label_bg, text_color,
+                    fixed_label_width=max_label_width,
+                    fixed_label_height=max_label_height
+                )
             labeled_images.append(pil_img)
     
         # STEP 4.5: Add spacing border around each image (if spacing > 0)
@@ -910,12 +917,96 @@ class ImageArray:
         return (canvas_tensor,)
 
 
+class RandomSubset:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_text": ("STRING", {
+                    "multiline": True,
+                    "default": ""
+                }),
+                "num_to_pick": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "step": 1
+                }),
+                "with_replacement": ("BOOLEAN", {
+                    "default": False
+                }),
+                "random_order": ("BOOLEAN", {
+                    "default": True
+                }),
+                "string_delimiter": ("STRING", {
+                    "default": "\\n"
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff
+                })
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("string_list", "merged_string", "pick_indices")
+    OUTPUT_IS_LIST = (True, False, True)
+    FUNCTION = "select_subset"
+    CATEGORY = "Image Label Tools"
+    DESCRIPTION = "Selects a random subset of newline-delimited strings."
+    
+    def select_subset(self, input_text, num_to_pick, with_replacement, random_order, 
+                     string_delimiter, seed):
+        # Parse input into list of strings
+        items = [line for line in input_text.split('\n') if line.strip()]
+        
+        if not items:
+            return ([], "", [])
+        
+        # Set random seed for reproducibility
+        rng = random.Random(seed)
+        
+        # Determine actual number to pick
+        actual_picks = min(num_to_pick, len(items)) if not with_replacement else num_to_pick
+        
+        # Pick subset
+        if with_replacement:
+            picked_indices = [rng.randint(0, len(items) - 1) for _ in range(actual_picks)]
+        else:
+            if actual_picks >= len(items):
+                picked_indices = list(range(len(items)))
+            else:
+                picked_indices = rng.sample(range(len(items)), actual_picks)
+        
+        # Get picked items
+        picked_items = [items[i] for i in picked_indices]
+        
+        # Randomize order if requested
+        if random_order:
+            combined = list(zip(picked_items, picked_indices))
+            rng.shuffle(combined)
+            picked_items, picked_indices = zip(*combined) if combined else ([], [])
+            picked_items = list(picked_items)
+            picked_indices = list(picked_indices)
+        
+        # Process delimiter (handle escaped newline)
+        actual_delimiter = string_delimiter.replace('\\n', '\n')
+        
+        # Create merged string
+        merged_string = actual_delimiter.join(picked_items)
+        
+        return (picked_items, merged_string, picked_indices)
+
+
+
 NODE_CLASS_MAPPINGS = {
     'ImageEqualizer': ImageEqualizer,
     'ImageArray': ImageArray,
+    'RandomSubset': RandomSubset,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     'ImageEqualizer': 'Image Equalizer',
     'ImageArray': 'Image Array',
+    'RandomSubset': 'Random Subset',
 }
