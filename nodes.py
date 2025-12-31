@@ -660,15 +660,17 @@ class ImageArray:
                 
                 for rows in range(1, num_images + 1):
                     cols = math.ceil(num_images / rows)
-                    # Calculate canvas aspect ratio with these dimensions
-                    canvas_width = cols * cell_width
-                    canvas_height = rows * cell_height
-                    canvas_ratio = canvas_width / canvas_height
-                    diff = abs(canvas_ratio - target_ratio)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_rows = rows
-                        best_cols = cols
+                    # Only consider if last row has at least one image
+                    if (rows - 1) * cols < num_images:
+                        # Calculate canvas aspect ratio with these dimensions
+                        canvas_width = cols * cell_width
+                        canvas_height = rows * cell_height
+                        canvas_ratio = canvas_width / canvas_height
+                        diff = abs(canvas_ratio - target_ratio)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_rows = rows
+                            best_cols = cols
                 
                 return best_rows, best_cols
             else:
@@ -685,25 +687,29 @@ class ImageArray:
             if cell_width and cell_height:
                 for rows in range(1, num_images + 1):
                     cols = math.ceil(num_images / rows)
-                    # Calculate canvas aspect ratio
-                    canvas_width = cols * cell_width
-                    canvas_height = rows * cell_height
-                    canvas_ratio = canvas_width / canvas_height
-                    diff = abs(canvas_ratio - target_ratio)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_rows = rows
-                        best_cols = cols
+                    # Only consider if last row has at least one image
+                    if (rows - 1) * cols < num_images:
+                        # Calculate canvas aspect ratio
+                        canvas_width = cols * cell_width
+                        canvas_height = rows * cell_height
+                        canvas_ratio = canvas_width / canvas_height
+                        diff = abs(canvas_ratio - target_ratio)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_rows = rows
+                            best_cols = cols
             else:
                 # Fallback: use number of images
                 for rows in range(1, num_images + 1):
                     cols = math.ceil(num_images / rows)
-                    ratio = cols / rows
-                    diff = abs(ratio - target_ratio)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_rows = rows
-                        best_cols = cols
+                    # Only consider if last row has at least one image
+                    if (rows - 1) * cols < num_images:
+                        ratio = cols / rows
+                        diff = abs(ratio - target_ratio)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_rows = rows
+                            best_cols = cols
             
             return best_rows, best_cols
         elif shape == 'smart_portrait':
@@ -715,25 +721,29 @@ class ImageArray:
             if cell_width and cell_height:
                 for rows in range(1, num_images + 1):
                     cols = math.ceil(num_images / rows)
-                    # Calculate canvas aspect ratio
-                    canvas_width = cols * cell_width
-                    canvas_height = rows * cell_height
-                    canvas_ratio = canvas_width / canvas_height
-                    diff = abs(canvas_ratio - target_ratio)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_rows = rows
-                        best_cols = cols
+                    # Only consider if last row has at least one image
+                    if (rows - 1) * cols < num_images:
+                        # Calculate canvas aspect ratio
+                        canvas_width = cols * cell_width
+                        canvas_height = rows * cell_height
+                        canvas_ratio = canvas_width / canvas_height
+                        diff = abs(canvas_ratio - target_ratio)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_rows = rows
+                            best_cols = cols
             else:
                 # Fallback: use number of images
                 for rows in range(1, num_images + 1):
                     cols = math.ceil(num_images / rows)
-                    ratio = cols / rows
-                    diff = abs(ratio - target_ratio)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_rows = rows
-                        best_cols = cols
+                    # Only consider if last row has at least one image
+                    if (rows - 1) * cols < num_images:
+                        ratio = cols / rows
+                        diff = abs(ratio - target_ratio)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_rows = rows
+                            best_cols = cols
             
             return best_rows, best_cols
         
