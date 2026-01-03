@@ -42,7 +42,7 @@ class ImageEqualizer:
             "required": {
                 "images": ("IMAGE",),
                 "size_mode": (["grow", "shrink"], {"default": "grow"}),
-                "upscale_method": (cls.upscale_methods, {"default": "bicubic"}),
+                "upscale_method": (cls.upscale_methods, {"default": "lanczos"}),
                 "keep_proportion": (["pad", "stretch", "resize", "crop", "total_pixels"], {"default": "pad"}),
                 "pad_color": (["black", "white", "gray", "average", "average_edge"], {"default": "black"}),
                 "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center"}),
