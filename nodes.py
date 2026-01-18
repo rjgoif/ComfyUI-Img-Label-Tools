@@ -283,14 +283,16 @@ class ImageArray:
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
                 'label_size': ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1}),
                 'font': (cls.font_files, {'default': font_default}),
-                'spacing': ('INT', {'default': 0, 'min': 0, 'max': 100, 'step': 1}),
+                'spacing': ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1}),
             },
             'optional': {
                 'label_input': ('STRING', {'forceInput': True}),
             }
         }
     
-    RETURN_TYPES = ('IMAGE',)
+    RETURN_TYPES = ('IMAGE', 'IMAGE')
+    RETURN_NAMES = ('array', 'images')
+    OUTPUT_IS_LIST = (False, True)
     FUNCTION = 'create_array'
     CATEGORY = 'Image Label Tools'
     DESCRIPTION = "Creates an array of images with optional labels in various layouts"
@@ -865,6 +867,13 @@ class ImageArray:
                 )
             labeled_images.append(pil_img)
     
+        # Convert labeled images (without spacing) to tensors for individual output
+        labeled_tensors = []
+        for pil_img in labeled_images:
+            img_np = np.array(pil_img).astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_np).unsqueeze(0)
+            labeled_tensors.append(img_tensor)
+    
         # STEP 4.5: Add spacing border around each image (if spacing > 0)
         if spacing > 0:
             spaced_images = []
@@ -924,7 +933,7 @@ class ImageArray:
     
         print(f"Image Array: {num_images} images | {shape} layout | {canvas_width}x{canvas_height}")
     
-        return (canvas_tensor,)
+        return (canvas_tensor, labeled_tensors)
 
 
 class RandomSubset:
