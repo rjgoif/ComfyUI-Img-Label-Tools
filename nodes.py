@@ -1138,12 +1138,340 @@ class LocalTimerEnd:
         return (passthrough, time_string, time_float)
 
 
+class DuckDuckGoImageSearch:
+    """
+    Fetches images from DuckDuckGo image search.
+    Requires: pip install duckduckgo-search requests Pillow
+    """
+
+    REGIONS = [
+        "no region", "us-en", "uk-en", "ca-en", "au-en", "de-de", "fr-fr",
+        "es-es", "it-it", "nl-nl", "pl-pl", "pt-pt", "ru-ru", "jp-jp",
+        "cn-zh", "in-en", "br-pt", "mx-es", "ar-es", "za-en",
+    ]
+    SAFE_SEARCH = ["moderate", "on", "off"]
+    SIZES = ["all", "Small", "Medium", "Large", "Wallpaper"]
+    COLORS = [
+        "all", "Monochrome", "Red", "Orange", "Yellow", "Green", "Blue",
+        "Purple", "Pink", "Brown", "Black", "Gray", "Teal", "White",
+        "color", "2tone",
+    ]
+    TYPES = ["all", "photo", "clipart", "gif", "transparent", "line"]
+    LAYOUTS = ["all", "Square", "Tall", "Wide"]
+    LICENSES = [
+        "all", "any", "Public", "Share", "ShareCommercially",
+        "Modify", "ModifyCommercially",
+    ]
+    AI_IMAGES = ["hide", "show"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "query":          ("STRING", {"multiline": True, "default": ""}),
+                "start":          ("INT",    {"default": 0,  "min": 0,   "step": 1}),
+                "num_results":    ("INT",    {"default": 1,  "min": 1,   "step": 1}),
+                "output_type":    (["list", "batch"],),
+                "region":         (cls.REGIONS,     {"default": "no region"}),
+                "safe_search":    (cls.SAFE_SEARCH,  {"default": "moderate"}),
+                "size":           (cls.SIZES,        {"default": "all"}),
+                "color":          (cls.COLORS,       {"default": "all"}),
+                "type_image":     (cls.TYPES,        {"default": "all"}),
+                "layout":         (cls.LAYOUTS,      {"default": "all"}),
+                "license_image":  (cls.LICENSES,     {"default": "all"}),
+                "ai_images":      (cls.AI_IMAGES,    {"default": "hide"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image(s)", "url(s)")
+    OUTPUT_IS_LIST = (False, True)
+    FUNCTION = "search"
+    CATEGORY = "Image Label Tools"
+    DESCRIPTION = "Fetches images from DuckDuckGo image search by query."
+
+    def search(self, query, start, num_results, output_type,
+               region, safe_search, size, color, type_image,
+               layout, license_image, ai_images):
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            raise ImportError("duckduckgo-search is not installed. Run: pip install duckduckgo-search")
+
+        import requests
+        from io import BytesIO
+
+        # DDG library wants empty string, not None, to mean "no filter"
+        def _opt(val):
+            return "" if val in ("all", "no region") else val
+
+        # duckduckgo_search uses lowercase safe search values
+        safesearch_map = {"on": "on", "moderate": "moderate", "off": "off"}
+
+        # AI image filter: DuckDuckGo uses "1" to filter AI images
+        filter_ai = "1" if ai_images == "hide" else None
+
+        kwargs = {"keywords": query, "max_results": start + num_results}
+
+        if region != "no region":
+            kwargs["region"] = region
+        if safe_search != "moderate":
+            kwargs["safesearch"] = safesearch_map.get(safe_search, "moderate")
+        if size != "all":
+            kwargs["size"] = size
+        if color != "all":
+            kwargs["color"] = color
+        if type_image != "all":
+            kwargs["type_image"] = type_image
+        if layout != "all":
+            kwargs["layout"] = layout
+        if license_image != "all":
+            kwargs["license_image"] = license_image
+
+        print(f"DDG Image Search: '{query}' | start={start} count={num_results}")
+
+        import time as _time
+
+        results = []
+        with DDGS(timeout=20) as ddgs:
+            for r in ddgs.images(keywords=query):
+                results.append(r)
+                if len(results) >= start + num_results:
+                    break
+
+        results = results[start:start + num_results]
+
+        if not results:
+            raise ValueError(f"DuckDuckGo image search returned no results for: '{query}'")
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        tensors = []
+        urls = []
+
+        for r in results:
+            url = r.get("image") or r.get("url", "")
+            urls.append(url)
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                resp.raise_for_status()
+                img = Image.open(BytesIO(resp.content)).convert("RGB")
+                arr = np.array(img).astype(np.float32) / 255.0
+                tensors.append(torch.from_numpy(arr))
+            except Exception as e:
+                print(f"DDG Image Search: failed to fetch {url}: {e}")
+                # Insert a small black placeholder so index alignment is preserved
+                tensors.append(torch.zeros(64, 64, 3))
+
+        if output_type == "batch":
+            # Pad all images to the same size before stacking
+            max_h = max(t.shape[0] for t in tensors)
+            max_w = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                h, w, c = t.shape
+                p = torch.zeros(max_h, max_w, c)
+                p[:h, :w, :] = t
+                padded.append(p)
+            output_tensor = torch.stack(padded, dim=0)
+        else:
+            # list mode: wrap each in a batch dim of 1
+            output_tensor = [t.unsqueeze(0) for t in tensors]
+
+        print(f"DDG Image Search: fetched {len(tensors)} image(s)")
+        return (output_tensor, urls)
+
+class LabelImage:
+    """Adds a single text label to a single image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        if os.path.exists(os.path.join(folder_paths.base_path, 'fonts')):
+            cls.font_dir = os.path.join(folder_paths.base_path, 'fonts')
+            cls.font_files = [f for f in os.listdir(cls.font_dir) if os.path.isfile(os.path.join(cls.font_dir, f))]
+            font_default = cls.font_files[0] if cls.font_files else 'arial.ttf'
+        else:
+            cls.font_dir = None
+            cls.font_files = ['arial.ttf']
+            font_default = 'arial.ttf'
+
+        return {
+            'required': {
+                'image':          ('IMAGE',),
+                'label':          ('STRING', {'multiline': True, 'default': ''}),
+                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
+                'label_size':     ('INT', {'default': 32, 'min': 1, 'max': 200, 'step': 1}),
+                'font':           (cls.font_files, {'default': font_default}),
+                'background':     (['white', 'black'], {'default': 'white'}),
+                'text_color':     (['black', 'white'], {'default': 'black'}),
+            },
+            'optional': {
+                'label_input': ('STRING', {'forceInput': True}),
+            }
+        }
+
+    RETURN_TYPES = ('IMAGE',)
+    RETURN_NAMES = ('image',)
+    FUNCTION = 'label_image'
+    CATEGORY = 'Image Label Tools'
+    DESCRIPTION = "Adds a text label to a single image. Label text can be typed or connected from another node."
+
+    # ------------------------------------------------------------------ helpers
+    # Re-use the same helpers as ImageArray (they are standalone methods so we
+    # duplicate them here to keep the class self-contained).
+
+    def get_text_size(self, font, text):
+        left, top, right, bottom = font.getbbox(text)
+        return right - left, bottom - top
+
+    def wrap_text(self, text, font, max_width):
+        wrapped_lines = []
+        for line in text.split('\n'):
+            words = line.split(' ')
+            if not words:
+                wrapped_lines.append('')
+                continue
+            new_line = words[0]
+            for word in words[1:]:
+                if int(font.getlength(new_line + ' ' + word)) <= max_width:
+                    new_line += ' ' + word
+                else:
+                    wrapped_lines.append(new_line)
+                    new_line = word
+            wrapped_lines.append(new_line)
+        return wrapped_lines
+
+    def _load_font(self, font_path, label_size):
+        try:
+            if self.font_dir:
+                font_file = os.path.join(self.font_dir, font_path)
+            else:
+                font_file = 'C:/Windows/Fonts/Arial.ttf'
+            return ImageFont.truetype(font_file, label_size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _add_label(self, image_pil, label_text, location, label_size, font_path, bg_color, text_color):
+        """Add label to a PIL image and return the combined PIL image."""
+        width, height = image_pil.size
+        font = self._load_font(font_path, label_size)
+        _, line_height = self.get_text_size(font, "Hg")
+
+        is_vertical      = location in ('left_vert', 'right_vert')
+        is_side_hor      = location in ('left_hor',  'right_hor')
+
+        # ---- compute label canvas size ----
+        if is_vertical:
+            max_width    = height
+            wrapped      = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            label_width  = max(1, len(wrapped)) * line_height + 30
+            label_height = height
+
+        elif is_side_hor:
+            max_width    = width // 2
+            wrapped      = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            max_lw       = max((int(font.getlength(l)) for l in wrapped if l), default=0)
+            label_width  = max_lw + 30
+            label_height = max(1, len(wrapped)) * (line_height + 5) + 30
+
+        else:  # top / bottom
+            max_width    = width
+            wrapped      = self.wrap_text(label_text, font, max_width) if label_text else ['']
+            label_width  = width
+            label_height = max(1, len(wrapped)) * (line_height + 5) + 30
+
+        # ---- draw label ----
+        label_img = Image.new('RGB', (label_width, label_height), bg_color)
+        draw      = ImageDraw.Draw(label_img)
+
+        if is_vertical:
+            # Draw horizontally, then rotate
+            temp_img  = Image.new('RGB', (label_height, label_width), bg_color)
+            temp_draw = ImageDraw.Draw(temp_img)
+            total_th  = sum(line_height + 5 for _ in wrapped) - 5
+            y_pos     = label_width - total_th - 15
+            for line in wrapped:
+                tw    = int(font.getlength(line))
+                x_pos = (label_height - tw) // 2
+                temp_draw.text((x_pos, y_pos), line, text_color, font=font)
+                y_pos += line_height + 5
+            if location == 'left_vert':
+                label_img = temp_img.rotate(90, expand=True)
+            else:
+                label_img = temp_img.rotate(270, expand=True)
+
+        else:
+            if location == 'top':
+                total_th = sum(line_height + 5 for _ in wrapped) - 5
+                y_pos    = label_height - total_th - 15
+            elif location == 'bottom':
+                y_pos = 15
+            else:  # side hor
+                total_th = sum(line_height + 5 for _ in wrapped) - 5
+                y_pos    = (label_height - total_th) // 2
+
+            for line in wrapped:
+                tw    = int(font.getlength(line))
+                x_pos = (label_width - tw) // 2
+                draw.text((x_pos, y_pos), line, text_color, font=font)
+                y_pos += line_height + 5
+
+        # ---- composite ----
+        if location == 'top':
+            combined = Image.new('RGB', (width, height + label_height), bg_color)
+            combined.paste(label_img, (0, 0))
+            combined.paste(image_pil, (0, label_height))
+        elif location == 'bottom':
+            combined = Image.new('RGB', (width, height + label_height), bg_color)
+            combined.paste(image_pil, (0, 0))
+            combined.paste(label_img, (0, height))
+        elif location in ('left_vert', 'left_hor'):
+            combined = Image.new('RGB', (width + label_width, height), bg_color)
+            y_off    = (height - label_height) // 2 if label_height < height else 0
+            combined.paste(label_img, (0, y_off))
+            combined.paste(image_pil, (label_width, 0))
+        else:  # right_vert, right_hor
+            combined = Image.new('RGB', (width + label_width, height), bg_color)
+            combined.paste(image_pil, (0, 0))
+            y_off    = (height - label_height) // 2 if label_height < height else 0
+            combined.paste(label_img, (width, y_off))
+
+        return combined
+
+    # ------------------------------------------------------------------ main
+    def label_image(self, image, label, label_location, label_size, font,
+                    background, text_color, label_input=None):
+
+        bg_color   = (255, 255, 255) if background == 'white' else (0, 0, 0)
+        txt_color  = (0, 0, 0)       if text_color  == 'black' else (255, 255, 255)
+
+        # label_input overrides the text widget
+        label_text = str(label_input) if label_input is not None else label
+
+        # image is a batch tensor (B, H, W, C); process each frame
+        results = []
+        for i in range(image.shape[0]):
+            frame_np  = (image[i].cpu().numpy() * 255).astype(np.uint8)
+            frame_pil = Image.fromarray(frame_np, 'RGB')
+
+            labeled   = self._add_label(frame_pil, label_text, label_location,
+                                        label_size, font, bg_color, txt_color)
+
+            out_np    = np.array(labeled).astype(np.float32) / 255.0
+            results.append(torch.from_numpy(out_np))
+
+        out_tensor = torch.stack(results, dim=0)
+        print(f"LabelImage: {image.shape[0]} frame(s) | location={label_location} | text='{label_text[:40]}'")
+        return (out_tensor,)
+
+
 NODE_CLASS_MAPPINGS = {
     'ImageEqualizer': ImageEqualizer,
     'ImageArray': ImageArray,
     'RandomSubset': RandomSubset,
     'LocalTimerStart': LocalTimerStart,
     'LocalTimerEnd': LocalTimerEnd,
+    'DuckDuckGoImageSearch': DuckDuckGoImageSearch,
+    'LabelImage': LabelImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1152,4 +1480,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'RandomSubset': 'Random Subset',
     'LocalTimerStart': 'Local Timer Start',
     'LocalTimerEnd': 'Local Timer End',
+    'DuckDuckGoImageSearch': 'DuckDuckGo img search',
+    'LabelImage': 'Label Image',
 }
