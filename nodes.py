@@ -1468,6 +1468,486 @@ class LabelImage:
         return (out_tensor,)
 
 
+class AdvancedStitcher:
+    """
+    Splits an image list into groups, stitches each group into an array,
+    and returns a batch of stitched images.
+
+    Group modes
+    -----------
+    every_N  : interleaved — group k contains images at indices k, k+N, k+2N, …
+               Produces N groups. Leftovers (when total not divisible by N) are
+               distributed front-to-back: group 0 gets the first extra image,
+               group 1 gets the second, etc.
+
+    length_N : chunked — group 0 = [0..N-1], group 1 = [N..2N-1], …
+               Last group is padded with blank filler if short.
+
+    Label cycling
+    -------------
+    The label list (K entries) restarts independently for each stitched group.
+    If K < group_size the remaining slots get blank (or repeat-last) labels.
+    label_end='blank'       → trailing slots are empty
+    label_end='repeat_last' → trailing slots repeat the final label in the list
+    """
+
+    INPUT_IS_LIST = True
+
+    # ------------------------------------------------------------------ setup
+    @classmethod
+    def INPUT_TYPES(cls):
+        if os.path.exists(os.path.join(folder_paths.base_path, 'fonts')):
+            cls.font_dir  = os.path.join(folder_paths.base_path, 'fonts')
+            cls.font_files = [f for f in os.listdir(cls.font_dir)
+                              if os.path.isfile(os.path.join(cls.font_dir, f))]
+            font_default = cls.font_files[0] if cls.font_files else 'arial.ttf'
+        else:
+            cls.font_dir   = None
+            cls.font_files = ['arial.ttf']
+            font_default   = 'arial.ttf'
+
+        return {
+            'required': {
+                'images':         ('IMAGE',),
+                'N':              ('INT', {'default': 4, 'min': 1, 'max': 256, 'step': 1}),
+                'group_mode':     (['every_N', 'length_N'], {'default': 'every_N'}),
+                # ---- label options ----
+                'labels':         ('STRING', {'multiline': True, 'default': ''}),
+                'label_end':      (['blank', 'repeat_last'], {'default': 'blank'}),
+                'label_location': (['top', 'bottom', 'left_vert', 'left_hor',
+                                    'right_vert', 'right_hor'], {'default': 'bottom'}),
+                'label_size':     ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1}),
+                'font':           (cls.font_files, {'default': font_default}),
+                'label_style':    (['white on black', 'black on white',
+                                    'white on dark gray', 'black on light gray'],
+                                   {'default': 'white on black'}),
+                # ---- layout options ----
+                'shape':          (['horizontal', 'vertical', 'square',
+                                    'smart_square', 'smart_landscape', 'smart_portrait'],
+                                   {'default': 'horizontal'}),
+                'background':     (['black', 'white'], {'default': 'black'}),
+                'resize':         (['grow', 'shrink'], {'default': 'grow'}),
+                'size_method':    (['pad', 'stretch', 'crop_center', 'fill'], {'default': 'pad'}),
+                'pad':            ('BOOLEAN', {'default': True}),
+                'spacing':        ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1}),
+            },
+            'optional': {
+                'label_input': ('STRING', {'forceInput': True}),
+            }
+        }
+
+    RETURN_TYPES  = ('IMAGE',)
+    RETURN_NAMES  = ('stitched_groups',)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION      = 'stitch'
+    CATEGORY      = 'Image Label Tools'
+    DESCRIPTION   = ("Splits an image list into N groups (interleaved or chunked), "
+                     "labels and stitches each group, and returns them as a list of images.")
+
+    # ------------------------------------------------------------------ helpers (mirrors ImageArray)
+
+    def _load_font(self, font_path, size):
+        try:
+            font_file = (os.path.join(self.font_dir, font_path)
+                         if self.font_dir else 'C:/Windows/Fonts/Arial.ttf')
+            return ImageFont.truetype(font_file, size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _get_text_size(self, font, text):
+        l, t, r, b = font.getbbox(text)
+        return r - l, b - t
+
+    def _wrap_text(self, text, font, max_width):
+        wrapped = []
+        for line in text.split('\n'):
+            words = line.split(' ')
+            if not words:
+                wrapped.append('')
+                continue
+            cur = words[0]
+            for w in words[1:]:
+                if int(font.getlength(cur + ' ' + w)) <= max_width:
+                    cur += ' ' + w
+                else:
+                    wrapped.append(cur)
+                    cur = w
+            wrapped.append(cur)
+        return wrapped
+
+    def _parse_labels(self, labels_text, label_input):
+        """Same logic as ImageArray.parse_labels."""
+        if label_input:
+            items = label_input if isinstance(label_input, list) else [label_input]
+            return [str(x) for x in items]
+        if not labels_text.strip():
+            return []
+        labels_text = labels_text.replace('\\n', '\x00')
+        out = []
+        for line in labels_text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ';' in line:
+                for part in line.replace('; ', ';').split(';'):
+                    part = part.strip()
+                    if part:
+                        out.append(part.replace('\x00', '\n'))
+            else:
+                out.append(line.replace('\x00', '\n'))
+        return out
+
+    def _calc_label_dims(self, label_text, location, label_size, font_path,
+                         img_w, img_h):
+        font = self._load_font(font_path, label_size)
+        _, lh = self._get_text_size(font, "Hg")
+        is_vert     = location in ('left_vert', 'right_vert')
+        is_side_hor = location in ('left_hor',  'right_hor')
+        if is_vert:
+            wrapped = self._wrap_text(label_text, font, img_h) if label_text else ['']
+            return max(1, len(wrapped)) * lh + 30, img_h
+        elif is_side_hor:
+            wrapped = self._wrap_text(label_text, font, img_w // 2) if label_text else ['']
+            mw = max((int(font.getlength(l)) for l in wrapped if l), default=0)
+            return mw + 30, max(1, len(wrapped)) * (lh + 5) + 30
+        else:
+            wrapped = self._wrap_text(label_text, font, img_w) if label_text else ['']
+            return img_w, max(1, len(wrapped)) * (lh + 5) + 30
+
+    def _add_label(self, image_pil, label_text, location, label_size, font_path,
+                   bg_color, text_color,
+                   fixed_label_width=None, fixed_label_height=None):
+        """Mirrors ImageArray.add_label_to_image exactly."""
+        width, height = image_pil.size
+        font = self._load_font(font_path, label_size)
+        _, line_height = self._get_text_size(font, "Hg")
+
+        is_vertical     = location in ('left_vert', 'right_vert')
+        is_side_hor     = location in ('left_hor',  'right_hor')
+
+        if fixed_label_width and fixed_label_height:
+            label_width  = fixed_label_width
+            label_height = fixed_label_height
+            if is_vertical:       mw = height
+            elif is_side_hor:     mw = width // 2
+            else:                 mw = width
+            wrapped = self._wrap_text(label_text, font, mw) if label_text else ['']
+        elif is_vertical:
+            wrapped      = self._wrap_text(label_text, font, height) if label_text else ['']
+            label_width  = max(1, len(wrapped)) * line_height + 30
+            label_height = height
+        elif is_side_hor:
+            wrapped      = self._wrap_text(label_text, font, width // 2) if label_text else ['']
+            mw           = max((int(font.getlength(l)) for l in wrapped if l), default=0)
+            label_width  = mw + 30
+            label_height = max(1, len(wrapped)) * (line_height + 5) + 30
+        else:
+            wrapped      = self._wrap_text(label_text, font, width) if label_text else ['']
+            label_width  = width
+            label_height = max(1, len(wrapped)) * (line_height + 5) + 30
+
+        label_img = Image.new('RGB', (label_width, label_height), bg_color)
+        draw      = ImageDraw.Draw(label_img)
+
+        if is_vertical:
+            temp = Image.new('RGB', (label_height, label_width), bg_color)
+            td   = ImageDraw.Draw(temp)
+            total_th = sum(line_height + 5 for _ in wrapped) - 5
+            y = label_width - total_th - 15
+            for line in wrapped:
+                x = (label_height - int(font.getlength(line))) // 2
+                td.text((x, y), line, text_color, font=font)
+                y += line_height + 5
+            label_img = temp.rotate(90 if location == 'left_vert' else 270, expand=True)
+        else:
+            if location == 'top':
+                total_th = sum(line_height + 5 for _ in wrapped) - 5
+                y = label_height - total_th - 15
+            elif location == 'bottom':
+                y = 15
+            else:
+                total_th = sum(line_height + 5 for _ in wrapped) - 5
+                y = (label_height - total_th) // 2
+            for line in wrapped:
+                x = (label_width - int(font.getlength(line))) // 2
+                draw.text((x, y), line, text_color, font=font)
+                y += line_height + 5
+
+        if location == 'top':
+            out = Image.new('RGB', (width, height + label_height), bg_color)
+            out.paste(label_img, (0, 0)); out.paste(image_pil, (0, label_height))
+        elif location == 'bottom':
+            out = Image.new('RGB', (width, height + label_height), bg_color)
+            out.paste(image_pil, (0, 0)); out.paste(label_img, (0, height))
+        elif location in ('left_vert', 'left_hor'):
+            out = Image.new('RGB', (width + label_width, height), bg_color)
+            yo = (height - label_height) // 2 if label_height < height else 0
+            out.paste(label_img, (0, yo)); out.paste(image_pil, (label_width, 0))
+        else:
+            out = Image.new('RGB', (width + label_width, height), bg_color)
+            yo = (height - label_height) // 2 if label_height < height else 0
+            out.paste(image_pil, (0, 0)); out.paste(label_img, (width, yo))
+        return out
+
+    def _resize_image(self, image_pil, tw, th, method, bg_color):
+        """Mirrors ImageArray.resize_image."""
+        if method == 'stretch':
+            return image_pil.resize((tw, th), Image.LANCZOS)
+        ir = image_pil.width / image_pil.height
+        tr = tw / th
+        if method == 'crop_center':
+            if ir > tr:
+                nh = th; nw = int(image_pil.width * th / image_pil.height)
+            else:
+                nw = tw; nh = int(image_pil.height * tw / image_pil.width)
+            r = image_pil.resize((nw, nh), Image.LANCZOS)
+            l = (nw - tw) // 2; t = (nh - th) // 2
+            return r.crop((l, t, l + tw, t + th))
+        elif method == 'fill':
+            if ir > tr:
+                nw = tw; nh = int(image_pil.height * tw / image_pil.width)
+            else:
+                nh = th; nw = int(image_pil.width * th / image_pil.height)
+            return image_pil.resize((nw, nh), Image.LANCZOS)
+        else:  # pad
+            if ir > tr:
+                nw = tw; nh = int(image_pil.height * tw / image_pil.width)
+            else:
+                nh = th; nw = int(image_pil.width * th / image_pil.height)
+            r = image_pil.resize((nw, nh), Image.LANCZOS)
+            padded = Image.new('RGB', (tw, th), bg_color)
+            padded.paste(r, ((tw - nw) // 2, (th - nh) // 2))
+            return padded
+
+    def _calc_grid(self, n, shape, cw=None, ch=None):
+        """Mirrors ImageArray.calculate_grid_dimensions."""
+        if shape == 'horizontal':   return 1, n
+        if shape == 'vertical':     return n, 1
+        if shape == 'square':
+            side = math.ceil(math.sqrt(n))
+            return side, math.ceil(n / side)
+        target = {'smart_square': 1.0, 'smart_landscape': 1.5, 'smart_portrait': 2/3}[shape]
+        best_diff = float('inf'); best = (1, n)
+        for rows in range(1, n + 1):
+            cols = math.ceil(n / rows)
+            if (rows - 1) * cols < n:
+                ratio = ((cols * cw) / (rows * ch)) if (cw and ch) else (cols / rows)
+                d = abs(ratio - target)
+                if d < best_diff:
+                    best_diff = d; best = (rows, cols)
+        return best
+
+    # ------------------------------------------------------------------ grouping
+
+    def _make_groups(self, pil_images, N, mode):
+        """
+        Returns a list of groups, where each group is a list of PIL images
+        (or None for blank filler slots).
+        """
+        total = len(pil_images)
+        if mode == 'every_N':
+            # N groups, interleaved
+            # Distribute leftovers: first (total % N) groups get one extra image
+            leftovers = total % N
+            groups = []
+            for k in range(N):
+                indices = list(range(k, total, N))
+                groups.append(indices)
+            # leftovers are already handled correctly by range(k, total, N)
+            # The groups with k < leftovers will naturally have one more element
+            # Now build PIL lists, padding shorter groups to match the longest
+            max_len = max(len(g) for g in groups)
+            result = []
+            for g in groups:
+                imgs = [pil_images[i] for i in g]
+                imgs += [None] * (max_len - len(imgs))
+                result.append(imgs)
+            return result
+        else:  # length_N
+            groups = []
+            for start in range(0, total, N):
+                chunk = list(pil_images[start:start + N])
+                chunk += [None] * (N - len(chunk))
+                groups.append(chunk)
+            return groups
+
+    # ------------------------------------------------------------------ stitch one group
+
+    def _stitch_group(self, group_images, label_list, label_end,
+                      label_location, label_size, font,
+                      bg_color, label_bg, text_color, spacing_color,
+                      resize, size_method, do_pad, shape):
+        """
+        Takes a list of PIL images (None = filler), labels them, and stitches
+        into a single PIL image using the same pipeline as ImageArray.
+        """
+        group_size = len(group_images)
+
+        # Build per-slot label texts
+        # Label list restarts from 0 for each group; K < group_size → blank or repeat_last
+        slot_labels = []
+        K = len(label_list)
+        for i in range(group_size):
+            if K == 0:
+                slot_labels.append('')
+            elif i < K:
+                slot_labels.append(label_list[i])
+            else:
+                # past end of label list
+                if label_end == 'repeat_last':
+                    slot_labels.append(label_list[-1])
+                else:  # blank
+                    slot_labels.append('')
+
+        # Build filler image (same size as first non-None image)
+        ref_img = next((img for img in group_images if img is not None), None)
+        if ref_img is None:
+            return None  # entire group is blank — shouldn't happen but guard anyway
+        filler = Image.new('RGB', ref_img.size, bg_color)
+
+        pil_imgs = [img if img is not None else filler for img in group_images]
+
+        # --- resize/pad to uniform size ---
+        widths  = [img.width  for img in pil_imgs]
+        heights = [img.height for img in pil_imgs]
+        if resize == 'grow':
+            tw, th = max(widths), max(heights)
+        else:
+            tw, th = min(widths), min(heights)
+
+        if do_pad:
+            pil_imgs = [self._resize_image(img, tw, th, size_method, bg_color)
+                        for img in pil_imgs]
+        else:
+            tw, th = max(widths), max(heights)
+
+        # --- calculate uniform label dimensions ---
+        max_lw = max_lh = 0
+        if label_size > 0:
+            for i, img in enumerate(pil_imgs):
+                lw, lh = self._calc_label_dims(
+                    slot_labels[i], label_location, label_size, font,
+                    img.width, img.height)
+                max_lw = max(max_lw, lw)
+                max_lh = max(max_lh, lh)
+
+        # --- label each image ---
+        labeled = []
+        for i, img in enumerate(pil_imgs):
+            if label_size > 0:
+                img = self._add_label(img, slot_labels[i], label_location,
+                                      label_size, font, label_bg, text_color,
+                                      fixed_label_width=max_lw,
+                                      fixed_label_height=max_lh)
+            labeled.append(img)
+
+        # --- add spacing ---
+        if spacing_color is not None and self._spacing > 0:
+            spaced = []
+            for img in labeled:
+                si = Image.new('RGB',
+                               (img.width + self._spacing * 2,
+                                img.height + self._spacing * 2),
+                               spacing_color)
+                si.paste(img, (self._spacing, self._spacing))
+                spaced.append(si)
+            labeled = spaced
+
+        # --- grid layout ---
+        cw = max(img.width  for img in labeled)
+        ch = max(img.height for img in labeled)
+        rows, cols = self._calc_grid(len(labeled), shape, cw, ch)
+
+        canvas_w = cw * cols
+        canvas_h = ch * rows
+        canvas = Image.new('RGB', (canvas_w, canvas_h), bg_color)
+
+        for i, img in enumerate(labeled):
+            r, c   = divmod(i, cols)
+            xo     = c * cw + (cw - img.width)  // 2
+            yo     = r * ch + (ch - img.height) // 2
+            canvas.paste(img, (xo, yo))
+
+        return canvas
+
+    # ------------------------------------------------------------------ main
+
+    def stitch(self, images, N, group_mode, labels, label_end,
+               label_location, label_size, font, label_style,
+               shape, background, resize, size_method, pad, spacing,
+               label_input=None):
+
+        # Unwrap list-wrapped scalars (INPUT_IS_LIST=True)
+        def uw(v): return v[0] if isinstance(v, list) else v
+        N              = uw(N)
+        group_mode     = uw(group_mode)
+        labels         = uw(labels)
+        label_end      = uw(label_end)
+        label_location = uw(label_location)
+        label_size     = uw(label_size)
+        font           = uw(font)
+        label_style    = uw(label_style)
+        shape          = uw(shape)
+        background     = uw(background)
+        resize         = uw(resize)
+        size_method    = uw(size_method)
+        do_pad         = uw(pad)
+        spacing_val    = uw(spacing)
+        self._spacing  = spacing_val  # stored for _stitch_group access
+
+        # Colors
+        bg_color = (0, 0, 0) if background == 'black' else (255, 255, 255)
+        style_map = {
+            'white on black':      ((0, 0, 0),       (255, 255, 255)),
+            'black on white':      ((255, 255, 255), (0, 0, 0)),
+            'white on dark gray':  ((64, 64, 64),    (255, 255, 255)),
+            'black on light gray': ((192, 192, 192), (0, 0, 0)),
+        }
+        label_bg, text_color = style_map.get(label_style, ((0, 0, 0), (255, 255, 255)))
+        spacing_color = bg_color  # spacing strip matches background
+
+        # Collect PIL images from tensor list
+        pil_images = []
+        for img_tensor in images:
+            if len(img_tensor.shape) == 4:
+                for b in range(img_tensor.shape[0]):
+                    arr = (img_tensor[b].cpu().numpy() * 255).astype(np.uint8)
+                    pil_images.append(Image.fromarray(arr))
+            else:
+                arr = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+                pil_images.append(Image.fromarray(arr))
+
+        total = len(pil_images)
+        print(f"AdvancedStitcher: {total} images | mode={group_mode} | N={N} | shape={shape}")
+
+        # Parse labels
+        label_list = self._parse_labels(labels, label_input)
+
+        # Build groups
+        groups = self._make_groups(pil_images, N, group_mode)
+
+        # Stitch each group
+        output_tensors = []
+        for gi, group in enumerate(groups):
+            stitched = self._stitch_group(
+                group, label_list, label_end,
+                label_location, label_size, font,
+                bg_color, label_bg, text_color, spacing_color,
+                resize, size_method, do_pad, shape)
+            if stitched is None:
+                continue
+            arr = np.array(stitched).astype(np.float32) / 255.0
+            output_tensors.append(torch.from_numpy(arr).unsqueeze(0))
+            print(f"  Group {gi}: {stitched.width}x{stitched.height}")
+
+        if not output_tensors:
+            # Fallback: return a blank tensor
+            blank = torch.zeros((1, 64, 64, 3))
+            output_tensors = [blank]
+
+        return (output_tensors,)
+
+
 NODE_CLASS_MAPPINGS = {
     'ImageEqualizer': ImageEqualizer,
     'ImageArray': ImageArray,
@@ -1476,6 +1956,7 @@ NODE_CLASS_MAPPINGS = {
     'LocalTimerEnd': LocalTimerEnd,
     'DuckDuckGoImageSearch': DuckDuckGoImageSearch,
     'LabelImage': LabelImage,
+    'AdvancedStitcher': AdvancedStitcher,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1486,4 +1967,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'LocalTimerEnd': 'Local Timer End',
     'DuckDuckGoImageSearch': 'DuckDuckGo img search',
     'LabelImage': 'Label Image',
+    'AdvancedStitcher': 'Advanced Stitcher',
 }
