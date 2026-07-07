@@ -84,7 +84,7 @@ Creates organized grids/arrays of images with optional text labels. Images are f
 
 **Labels:**
 - `labels` - Multiline text box for labels (one per line, or semicolon-separated)
-- `label_end` - If more imaages than labels, what to do? Either start over with repeats or just stop 
+- `label_end` - If more images than labels, what to do? Either start over with repeats or just stop 
 - `label_location` - Where to place labels.
 - `label_size` - Font size in pixels (8-200, default 32)
 - `font` - Font selection from ComfyUI/fonts directory (falls back to Arial)
