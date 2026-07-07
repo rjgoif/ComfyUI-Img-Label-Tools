@@ -1301,8 +1301,7 @@ class LabelImage:
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
                 'label_size':     ('INT', {'default': 32, 'min': 1, 'max': 200, 'step': 1}),
                 'font':           (cls.font_files, {'default': font_default}),
-                'background':     (['white', 'black'], {'default': 'white'}),
-                'text_color':     (['black', 'white'], {'default': 'black'}),
+                'label_style':    (['black on white', 'white on black', 'white on dark gray', 'black on light gray'], {'default': 'white on black'}),
             },
             'optional': {
                 'label_input': ('STRING', {'forceInput': True}),
@@ -1439,10 +1438,15 @@ class LabelImage:
 
     # ------------------------------------------------------------------ main
     def label_image(self, image, label, label_location, label_size, font,
-                    background, text_color, label_input=None):
+                    label_style, label_input=None):
 
-        bg_color   = (255, 255, 255) if background == 'white' else (0, 0, 0)
-        txt_color  = (0, 0, 0)       if text_color  == 'black' else (255, 255, 255)
+        style_map = {
+            'black on white':      ((255, 255, 255), (0, 0, 0)),
+            'white on black':      ((0, 0, 0),       (255, 255, 255)),
+            'white on dark gray':  ((64, 64, 64),    (255, 255, 255)),
+            'black on light gray': ((192, 192, 192), (0, 0, 0)),
+        }
+        bg_color, txt_color = style_map.get(label_style, ((255, 255, 255), (0, 0, 0)))
 
         # label_input overrides the text widget
         label_text = str(label_input) if label_input is not None else label
