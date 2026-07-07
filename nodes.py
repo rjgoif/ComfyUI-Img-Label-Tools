@@ -277,7 +277,7 @@ class ImageArray:
                 'resize': (['grow', 'shrink'], {'default': 'grow'}),
                 'size_method': (['pad', 'stretch', 'crop_center', 'fill'], {'default': 'pad'}),
                 'pad': ('BOOLEAN', {'default': True}),
-                'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait'], {'default': 'square'}),
+                'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait'], {'default': 'horizontal'}),
                 'labels': ('STRING', {'multiline': True, 'default': ''}),
                 'label_end': (['loop', 'end'], {'default': 'loop'}),
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
