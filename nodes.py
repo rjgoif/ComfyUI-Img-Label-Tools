@@ -9,10 +9,12 @@ Credits:
 
 import torch
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import os
+import re
 import folder_paths
 import math
+from pathlib import Path
 from comfy.utils import common_upscale
 
 MAX_RESOLUTION = 16384
@@ -254,6 +256,49 @@ pad_color options:
 
 
 
+
+def _parse_ratio(text):
+    """
+    Parse a W:H ratio string into a float (W/H).
+    Accepts: '16:9', '16/9', '1.78', '3W x 1H', '3w1h', '3x1', '0.5', etc.
+    Returns None if text is blank or unparseable.
+    """
+    import re
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+
+    # colon form  16:9
+    m = re.match(r'^([\d.]+)\s*:\s*([\d.]+)$', t)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        return w / h if h else None
+
+    # fraction form  16/9
+    m = re.match(r'^([\d.]+)\s*/\s*([\d.]+)$', t)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        return w / h if h else None
+
+    # WxH with explicit W/H letters: "3W x 1H", "3w1h"
+    m = re.match(r'^([\d.]+)\s*[Ww]\s*[Xx*]?\s*([\d.]+)\s*[Hh]$', t)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        return w / h if h else None
+
+    # WxH with x/* separator only (no letters): "3x1", "3*1"
+    m = re.match(r'^([\d.]+)\s*[Xx*]\s*([\d.]+)$', t)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        return w / h if h else None
+
+    # plain decimal / integer
+    try:
+        v = float(t)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
 class ImageArray:
     """Creates labeled image arrays in various layouts"""
     INPUT_IS_LIST = True
@@ -274,10 +319,11 @@ class ImageArray:
             'required': {
                 'images': ('IMAGE',),
                 'background': (['white', 'black'], {'default': 'white'}),
-                'resize': (['grow', 'shrink'], {'default': 'grow'}),
-                'size_method': (['pad', 'stretch', 'crop_center', 'fill'], {'default': 'pad'}),
-                'pad': ('BOOLEAN', {'default': True}),
                 'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait'], {'default': 'horizontal'}),
+                'smart_ratio': ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides shape picklist when filled.'}),
+                'resize_any': ('BOOLEAN', {'default': True, 'tooltip': 'ON: normalize image sizes before stitching. OFF: place at native sizes.'}),
+                'size_guide': (['largest', 'smallest'], {'default': 'largest', 'tooltip': 'Target size when resize_any is ON: match largest or smallest image.'}),
+                'size_method': (['pad small dim', 'stretch', 'crop_center', 'crop large dim'], {'default': 'pad small dim', 'tooltip': 'pad small dim: letterbox, fill leftover with bg. stretch: distort to fit. crop_center: scale-to-fill, crop center. crop large dim: scale-to-fill, large axis overflows/clips.'}),
                 'labels': ('STRING', {'multiline': True, 'default': ''}),
                 'label_end': (['loop', 'end'], {'default': 'loop'}),
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
@@ -600,7 +646,7 @@ class ImageArray:
             top = (new_height - target_height) // 2
             return resized.crop((left, top, left + target_width, top + target_height))
         
-        elif method == 'fill':
+        elif method == 'crop large dim':
             # Scale to fill completely (may crop)
             img_ratio = image_pil.width / image_pil.height
             target_ratio = target_width / target_height
@@ -614,7 +660,7 @@ class ImageArray:
             
             return image_pil.resize((new_width, new_height), Image.LANCZOS)
         
-        else:  # pad
+        else:  # pad small dim
             # Scale to fit, then pad
             img_ratio = image_pil.width / image_pil.height
             target_ratio = target_width / target_height
@@ -640,8 +686,25 @@ class ImageArray:
             
             return padded
     
-    def calculate_grid_dimensions(self, num_images, shape, cell_width=None, cell_height=None):
+    def calculate_grid_dimensions(self, num_images, shape, cell_width=None, cell_height=None, smart_ratio=None):
         """Calculate grid rows and columns based on shape"""
+        # If a custom ratio is provided, treat as smart search regardless of shape picklist
+        parsed_ratio = _parse_ratio(smart_ratio) if smart_ratio else None
+        if parsed_ratio is not None:
+            best_diff = float('inf')
+            best_rows, best_cols = 1, num_images
+            for rows in range(1, num_images + 1):
+                cols = math.ceil(num_images / rows)
+                if (rows - 1) * cols < num_images:
+                    if cell_width and cell_height:
+                        ratio = (cols * cell_width) / (rows * cell_height)
+                    else:
+                        ratio = cols / rows
+                    diff = abs(ratio - parsed_ratio)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_rows, best_cols = rows, cols
+            return best_rows, best_cols
         if shape == 'horizontal':
             return 1, num_images
         elif shape == 'vertical':
@@ -751,15 +814,16 @@ class ImageArray:
         
         return 1, num_images
     
-    def create_array(self, images, background, resize, size_method, pad, shape, 
+    def create_array(self, images, background, shape, smart_ratio, resize_any, size_guide, size_method, 
                     labels, label_end, label_location, label_size, font, spacing, label_input=None):
         """Create array of labeled images"""
         # Extract parameters from lists
         background = background[0] if isinstance(background, list) else background
-        resize = resize[0] if isinstance(resize, list) else resize
-        size_method = size_method[0] if isinstance(size_method, list) else size_method
-        pad = pad[0] if isinstance(pad, list) else pad
         shape = shape[0] if isinstance(shape, list) else shape
+        smart_ratio = smart_ratio[0] if isinstance(smart_ratio, list) else smart_ratio
+        resize_any = resize_any[0] if isinstance(resize_any, list) else resize_any
+        size_guide = size_guide[0] if isinstance(size_guide, list) else size_guide
+        size_method = size_method[0] if isinstance(size_method, list) else size_method
         labels = labels[0] if isinstance(labels, list) else labels
         label_end = label_end[0] if isinstance(label_end, list) else label_end
         label_location = label_location[0] if isinstance(label_location, list) else label_location
@@ -801,15 +865,15 @@ class ImageArray:
         widths = [img.width for img in pil_images]
         heights = [img.height for img in pil_images]
     
-        if resize == 'grow':
+        if size_guide == 'largest':
             target_width = max(widths)
             target_height = max(heights)
-        else:  # shrink
+        else:  # smallest
             target_width = min(widths)
             target_height = min(heights)
     
-        # STEP 2: Resize/pad all images to target dimensions if pad is enabled
-        if pad:
+        # STEP 2: Resize/pad all images to target dimensions if resize_any is enabled
+        if resize_any:
             processed_images = []
             for pil_img in pil_images:
                 processed = self.resize_image(pil_img, target_width, target_height, size_method, bg_color)
@@ -1509,7 +1573,7 @@ class AdvancedStitcher:
         return {
             'required': {
                 'images':         ('IMAGE',),
-                'N':              ('INT', {'default': 4, 'min': 1, 'max': 256, 'step': 1}),
+                'N':              ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1}),
                 'group_mode':     (['every_N', 'length_N'], {'default': 'every_N'}),
                 # ---- label options ----
                 'labels':         ('STRING', {'multiline': True, 'default': ''}),
@@ -1524,12 +1588,22 @@ class AdvancedStitcher:
                 # ---- layout options ----
                 'shape':          (['horizontal', 'vertical', 'square',
                                     'smart_square', 'smart_landscape', 'smart_portrait'],
-                                   {'default': 'horizontal'}),
-                'background':     (['black', 'white'], {'default': 'black'}),
-                'resize':         (['grow', 'shrink'], {'default': 'grow'}),
-                'size_method':    (['pad', 'stretch', 'crop_center', 'fill'], {'default': 'pad'}),
-                'pad':            ('BOOLEAN', {'default': True}),
-                'spacing':        ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1}),
+                                   {'default': 'horizontal',
+                                    'tooltip': 'Grid layout for each stitched group.'}),
+                'smart_ratio':    ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides shape picklist when filled.'}),
+                'background':     (['black', 'white'], {'default': 'black',
+                                    'tooltip': 'Canvas fill color.'}),
+                'resize_any':     ('BOOLEAN', {'default': True,
+                                    'tooltip': 'ON: normalize image sizes before stitching. OFF: place at native sizes.'}),
+                'size_guide':     (['largest', 'smallest'], {'default': 'largest',
+                                    'tooltip': 'Target size when resize_any is ON: match largest or smallest image.'}),
+                'size_method':    (['pad small dim', 'stretch', 'crop_center', 'crop large dim'],
+                                   {'default': 'pad small dim',
+                                    'tooltip': 'pad small dim: letterbox, fill leftover with bg. stretch: distort to fit. crop_center: scale-to-fill, crop center. crop large dim: scale-to-fill, large axis overflows/clips.'}),
+                'pad_axis':       (['both', 'height_only', 'width_only'], {'default': 'both',
+                                    'tooltip': 'Which axis to normalize. height_only: same height, widths vary (good for horizontal). width_only: same width, heights vary (good for vertical).'}),
+                'spacing':        ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1,
+                                    'tooltip': 'Background-color border around each image (px).'}),
             },
             'optional': {
                 'label_input': ('STRING', {'forceInput': True}),
@@ -1703,7 +1777,7 @@ class AdvancedStitcher:
             r = image_pil.resize((nw, nh), Image.LANCZOS)
             l = (nw - tw) // 2; t = (nh - th) // 2
             return r.crop((l, t, l + tw, t + th))
-        elif method == 'fill':
+        elif method == 'crop large dim':
             if ir > tr:
                 nw = tw; nh = int(image_pil.height * tw / image_pil.width)
             else:
@@ -1719,20 +1793,22 @@ class AdvancedStitcher:
             padded.paste(r, ((tw - nw) // 2, (th - nh) // 2))
             return padded
 
-    def _calc_grid(self, n, shape, cw=None, ch=None):
+    def _calc_grid(self, n, shape, cw=None, ch=None, smart_ratio=None):
         """Mirrors ImageArray.calculate_grid_dimensions."""
-        if shape == 'horizontal':   return 1, n
-        if shape == 'vertical':     return n, 1
-        if shape == 'square':
-            side = math.ceil(math.sqrt(n))
-            return side, math.ceil(n / side)
-        target = {'smart_square': 1.0, 'smart_landscape': 1.5, 'smart_portrait': 2/3}[shape]
+        parsed_ratio = _parse_ratio(smart_ratio) if smart_ratio else None
+        if parsed_ratio is None:
+            if shape == 'horizontal':   return 1, n
+            if shape == 'vertical':     return n, 1
+            if shape == 'square':
+                side = math.ceil(math.sqrt(n))
+                return side, math.ceil(n / side)
+            parsed_ratio = {'smart_square': 1.0, 'smart_landscape': 1.5, 'smart_portrait': 2/3}.get(shape, 1.0)
         best_diff = float('inf'); best = (1, n)
         for rows in range(1, n + 1):
             cols = math.ceil(n / rows)
             if (rows - 1) * cols < n:
                 ratio = ((cols * cw) / (rows * ch)) if (cw and ch) else (cols / rows)
-                d = abs(ratio - target)
+                d = abs(ratio - parsed_ratio)
                 if d < best_diff:
                     best_diff = d; best = (rows, cols)
         return best
@@ -1776,7 +1852,7 @@ class AdvancedStitcher:
     def _stitch_group(self, group_images, label_list, label_end,
                       label_location, label_size, font,
                       bg_color, label_bg, text_color, spacing_color,
-                      resize, size_method, do_pad, shape):
+                      size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=None):
         """
         Takes a list of PIL images (None = filler), labels them, and stitches
         into a single PIL image using the same pipeline as ImageArray.
@@ -1810,14 +1886,25 @@ class AdvancedStitcher:
         # --- resize/pad to uniform size ---
         widths  = [img.width  for img in pil_imgs]
         heights = [img.height for img in pil_imgs]
-        if resize == 'grow':
+        if size_guide == 'largest':
             tw, th = max(widths), max(heights)
         else:
             tw, th = min(widths), min(heights)
 
         if do_pad:
-            pil_imgs = [self._resize_image(img, tw, th, size_method, bg_color)
-                        for img in pil_imgs]
+            resized = []
+            for img in pil_imgs:
+                if pad_axis == 'height_only':
+                    eff_tw, eff_th = img.width, th
+                elif pad_axis == 'width_only':
+                    eff_tw, eff_th = tw, img.height
+                else:
+                    eff_tw, eff_th = tw, th
+                if img.width == eff_tw and img.height == eff_th:
+                    resized.append(img)
+                else:
+                    resized.append(self._resize_image(img, eff_tw, eff_th, size_method, bg_color))
+            pil_imgs = resized
         else:
             tw, th = max(widths), max(heights)
 
@@ -1856,17 +1943,40 @@ class AdvancedStitcher:
         # --- grid layout ---
         cw = max(img.width  for img in labeled)
         ch = max(img.height for img in labeled)
-        rows, cols = self._calc_grid(len(labeled), shape, cw, ch)
+        rows, cols = self._calc_grid(len(labeled), shape, cw, ch, smart_ratio=smart_ratio)
 
-        canvas_w = cw * cols
-        canvas_h = ch * rows
-        canvas = Image.new('RGB', (canvas_w, canvas_h), bg_color)
+        # Use variable-size canvas when images may have different sizes:
+        # - resize_any is off (native sizes), OR pad_axis restricts one axis
+        use_var_w = (not do_pad) or pad_axis == 'height_only'
+        use_var_h = (not do_pad) or pad_axis == 'width_only'
 
-        for i, img in enumerate(labeled):
-            r, c   = divmod(i, cols)
-            xo     = c * cw + (cw - img.width)  // 2
-            yo     = r * ch + (ch - img.height) // 2
-            canvas.paste(img, (xo, yo))
+        if rows == 1 and use_var_w:
+            canvas_w = sum(img.width for img in labeled)
+            canvas_h = ch
+            canvas = Image.new('RGB', (canvas_w, canvas_h), bg_color)
+            x = 0
+            for img in labeled:
+                yo = (ch - img.height) // 2
+                canvas.paste(img, (x, yo))
+                x += img.width
+        elif cols == 1 and use_var_h:
+            canvas_w = cw
+            canvas_h = sum(img.height for img in labeled)
+            canvas = Image.new('RGB', (canvas_w, canvas_h), bg_color)
+            y = 0
+            for img in labeled:
+                xo = (cw - img.width) // 2
+                canvas.paste(img, (xo, y))
+                y += img.height
+        else:
+            canvas_w = cw * cols
+            canvas_h = ch * rows
+            canvas = Image.new('RGB', (canvas_w, canvas_h), bg_color)
+            for i, img in enumerate(labeled):
+                r, c = divmod(i, cols)
+                xo   = c * cw + (cw - img.width)  // 2
+                yo   = r * ch + (ch - img.height) // 2
+                canvas.paste(img, (xo, yo))
 
         return canvas
 
@@ -1874,7 +1984,7 @@ class AdvancedStitcher:
 
     def stitch(self, images, N, group_mode, labels, label_end,
                label_location, label_size, font, label_style,
-               shape, background, resize, size_method, pad, spacing,
+               shape, smart_ratio, background, resize_any, size_guide, size_method, pad_axis, spacing,
                label_input=None):
 
         # Unwrap list-wrapped scalars (INPUT_IS_LIST=True)
@@ -1888,10 +1998,12 @@ class AdvancedStitcher:
         font           = uw(font)
         label_style    = uw(label_style)
         shape          = uw(shape)
+        smart_ratio    = uw(smart_ratio)
         background     = uw(background)
-        resize         = uw(resize)
         size_method    = uw(size_method)
-        do_pad         = uw(pad)
+        do_pad         = uw(resize_any)
+        size_guide     = uw(size_guide)
+        pad_axis       = uw(pad_axis)
         spacing_val    = uw(spacing)
         self._spacing  = spacing_val  # stored for _stitch_group access
 
@@ -1933,7 +2045,7 @@ class AdvancedStitcher:
                 group, label_list, label_end,
                 label_location, label_size, font,
                 bg_color, label_bg, text_color, spacing_color,
-                resize, size_method, do_pad, shape)
+                size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=smart_ratio)
             if stitched is None:
                 continue
             arr = np.array(stitched).astype(np.float32) / 255.0
@@ -1948,6 +2060,192 @@ class AdvancedStitcher:
         return (output_tensors,)
 
 
+class LoadImagesFromFolder:
+    SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".webp", ".bmp"}
+
+    FILTER_TYPES = ["contains", "starts with", "ends with", "regex"]
+
+    SELECT_SORT_OPTIONS = [
+        "name ascending", "name descending",
+        "total pixels ascending", "total pixels descending",
+        "aspect ratio ascending", "aspect ratio descending",
+        "date modified ascending", "date modified descending",
+        "random",
+    ]
+
+    OUTPUT_SORT_OPTIONS = [
+        "none",
+        "name ascending", "name descending",
+        "total pixels ascending", "total pixels descending",
+        "aspect ratio ascending", "aspect ratio descending",
+        "date created ascending", "date created descending",
+        "date modified ascending", "date modified descending",
+        "random",
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "folder": ("STRING", {"default": "", "tooltip": "Root folder to search for images."}),
+                "filter": ("STRING", {"default": "", "tooltip": "Text (or regex pattern) to match against filenames. Leave blank to match all supported image types: png, jpg, jpeg, gif, tiff, tif, webp, bmp."}),
+                "filter_type": (cls.FILTER_TYPES, {"default": "contains", "tooltip": "How 'filter' is matched against the filename."}),
+                "filter_case_sensitive": ("BOOLEAN", {"default": False, "tooltip": "Whether the filter match is case sensitive."}),
+                "filter_include_extension": ("BOOLEAN", {"default": False, "tooltip": "If true, match the filter against the filename including its extension. If false, only the name without extension is matched."}),
+                "every_n": ("INT", {"default": 1, "min": 1, "tooltip": "Keep every Nth image from the filtered/select-sorted pool. 1 = every image, 2 = every other, 3 = every third, etc."}),
+                "limit": ("INT", {"default": 0, "min": 0, "tooltip": "Max number of images to keep after every_n stepping. 0 = no limit."}),
+                "select_sort": (cls.SELECT_SORT_OPTIONS, {"default": "name ascending", "tooltip": "Order the filtered pool is sorted into BEFORE every_n/limit are applied. 'random' uses seed."}),
+                "output_sort": (cls.OUTPUT_SORT_OPTIONS, {"default": "none", "tooltip": "Order applied to the final selected images for output. 'none' preserves the order they came out of the every_n/limit step. 'random' uses seed."}),
+                "subdirectories": ("BOOLEAN", {"default": False, "tooltip": "Whether to search subdirectories of folder."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "Seed used whenever select_sort or output_sort is set to 'random'."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "STRING", "INT", "INT")
+    RETURN_NAMES = ("images", "file_paths", "filenames", "filenames_no_ext", "subdirs", "directory", "filtered_count", "output_count")
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, False, False)
+    FUNCTION = "load_images"
+    CATEGORY = "Image Label Tools"
+    DESCRIPTION = """
+Loads images from a folder with filtering, stepping, limiting, and sorting.
+
+filter / filter_type / filter_case_sensitive / filter_include_extension control which
+files (already restricted to supported image extensions) are kept.
+
+select_sort orders the filtered pool BEFORE every_n stepping and limit are applied.
+output_sort re-orders the final selected images for output ('none' = selection order).
+
+subdirs gives each image's folder path relative to root, as a backslash-wrapped
+segment: "\" for files directly in root, "\vacation\" for a subfolder. directory
+is the full folder path (root + subdirs) with a terminal backslash, no filename.
+Concatenating root + subdirs + filename (or just using directory + filename)
+reconstructs the full path, e.g. "C:\\pics" + "\\vacation\\" + "0001.jpg".
+
+seed drives both select_sort='random' and output_sort='random' (independently).
+"""
+
+    def _get_meta(self, p, cache):
+        key = str(p)
+        if key not in cache:
+            try:
+                with Image.open(p) as im:
+                    w, h = im.size
+            except Exception as e:
+                print(f"LoadImagesFromFolder: could not read size of {p}: {e}")
+                w, h = 0, 0
+            try:
+                st = p.stat()
+                mtime, ctime = st.st_mtime, st.st_ctime
+            except Exception as e:
+                print(f"LoadImagesFromFolder: could not stat {p}: {e}")
+                mtime, ctime = 0, 0
+            cache[key] = {"w": w, "h": h, "mtime": mtime, "ctime": ctime}
+        return cache[key]
+
+    def _sort_key(self, p, criterion, cache):
+        meta = self._get_meta(p, cache)
+        if criterion.startswith("name"):
+            return p.name.lower()
+        elif criterion.startswith("total pixels"):
+            return meta["w"] * meta["h"]
+        elif criterion.startswith("aspect ratio"):
+            return (meta["w"] / meta["h"]) if meta["h"] else 0.0
+        elif criterion.startswith("date modified"):
+            return meta["mtime"]
+        elif criterion.startswith("date created"):
+            return meta["ctime"]
+        return 0
+
+    def load_images(self, folder, filter, filter_type, filter_case_sensitive, filter_include_extension,
+                     every_n, limit, select_sort, output_sort, subdirectories, seed):
+
+        root = Path(folder)
+        root_for_concat = folder.rstrip("\\/")
+        if not root.is_dir():
+            print(f"LoadImagesFromFolder: folder does not exist or is not a directory: {folder}")
+            empty = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            return ([empty], [], [], [], [], [], 0, 0)
+
+        if subdirectories:
+            all_files = [p for p in root.rglob("*") if p.is_file()]
+        else:
+            all_files = [p for p in root.iterdir() if p.is_file()]
+
+        candidates = [p for p in all_files if p.suffix.lower() in self.SUPPORTED_EXTENSIONS]
+
+        if filter:
+            matched = []
+            for p in candidates:
+                target = p.name if filter_include_extension else p.stem
+                if filter_type == "regex":
+                    flags = 0 if filter_case_sensitive else re.IGNORECASE
+                    try:
+                        if re.search(filter, target, flags):
+                            matched.append(p)
+                    except re.error as e:
+                        print(f"LoadImagesFromFolder: invalid regex '{filter}': {e}")
+                        matched = []
+                        break
+                else:
+                    t = target if filter_case_sensitive else target.lower()
+                    f = filter if filter_case_sensitive else filter.lower()
+                    if filter_type == "contains" and f in t:
+                        matched.append(p)
+                    elif filter_type == "starts with" and t.startswith(f):
+                        matched.append(p)
+                    elif filter_type == "ends with" and t.endswith(f):
+                        matched.append(p)
+            candidates = matched
+
+        filtered_count = len(candidates)
+
+        meta_cache = {}
+
+        pool = list(candidates)
+        if select_sort == "random":
+            random.Random(seed).shuffle(pool)
+        else:
+            pool.sort(key=lambda p: self._sort_key(p, select_sort, meta_cache),
+                       reverse=select_sort.endswith("descending"))
+
+        stepped = pool[::every_n]
+        if limit > 0:
+            stepped = stepped[:limit]
+        selected = stepped
+
+        if output_sort == "random":
+            random.Random(seed).shuffle(selected)
+        elif output_sort != "none":
+            selected.sort(key=lambda p: self._sort_key(p, output_sort, meta_cache),
+                           reverse=output_sort.endswith("descending"))
+
+        images, file_paths, filenames, filenames_no_ext, subdirs, directories = [], [], [], [], [], []
+
+        for p in selected:
+            try:
+                img = Image.open(p)
+                img = ImageOps.exif_transpose(img)
+                img = img.convert("RGB")
+                arr = np.array(img).astype(np.float32) / 255.0
+                tensor = torch.from_numpy(arr)[None, ]
+            except Exception as e:
+                print(f"LoadImagesFromFolder: failed to load {p}: {e}")
+                continue
+            images.append(tensor)
+            file_paths.append(str(p))
+            filenames.append(p.name)
+            filenames_no_ext.append(p.stem)
+            rel_parts = p.parent.relative_to(root).parts
+            subdir = "\\" + "\\".join(rel_parts) + "\\" if rel_parts else "\\"
+            subdirs.append(subdir)
+            directories.append(root_for_concat + subdir)
+
+        if not images:
+            images = [torch.zeros((1, 1, 1, 3), dtype=torch.float32)]
+
+        return (images, file_paths, filenames, filenames_no_ext, subdirs, directories, filtered_count, len(file_paths))
+
+
 NODE_CLASS_MAPPINGS = {
     'ImageEqualizer': ImageEqualizer,
     'ImageArray': ImageArray,
@@ -1957,6 +2255,7 @@ NODE_CLASS_MAPPINGS = {
     'DuckDuckGoImageSearch': DuckDuckGoImageSearch,
     'LabelImage': LabelImage,
     'AdvancedStitcher': AdvancedStitcher,
+    'LoadImagesFromFolder': LoadImagesFromFolder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1968,4 +2267,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'DuckDuckGoImageSearch': 'DuckDuckGo img search',
     'LabelImage': 'Label Image',
     'AdvancedStitcher': 'Advanced Stitcher',
+    'LoadImagesFromFolder': 'Load Images From Folder(s)',
 }
