@@ -299,6 +299,26 @@ def _parse_ratio(text):
     except ValueError:
         return None
 
+def _forced_grid(n, shape, forced_n):
+    """
+    Return (rows, cols) for the force_rows / force_cols shapes.
+    Fill order is unchanged (row-major: across a row, then down).
+    force_rows: columns = ceil(n / forced_n); rows is then the number of rows
+                actually needed, so no blank row is ever produced.
+    force_cols: columns = forced_n; rows = ceil(n / cols).
+    forced_n is clamped to 1..n.
+    """
+    n = max(1, int(n))
+    forced_n = max(1, min(int(forced_n), n))
+    if shape == 'force_rows':
+        cols = math.ceil(n / forced_n)
+        rows = math.ceil(n / cols)
+    else:  # force_cols
+        cols = forced_n
+        rows = math.ceil(n / cols)
+    return rows, cols
+
+
 class ImageArray:
     """Creates labeled image arrays in various layouts"""
     INPUT_IS_LIST = True
@@ -319,8 +339,9 @@ class ImageArray:
             'required': {
                 'images': ('IMAGE',),
                 'background': (['white', 'black'], {'default': 'white'}),
-                'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait'], {'default': 'horizontal'}),
-                'smart_ratio': ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides shape picklist when filled.'}),
+                'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait', 'force_rows', 'force_cols'], {'default': 'horizontal', 'tooltip': 'Grid layout. horizontal: 1 row. vertical: 1 column. square: closest to square. smart_square / smart_landscape (3:2) / smart_portrait (2:3): pick the grid whose overall canvas shape is closest to the target. force_rows: output has forced_N rows. force_cols: output has forced_N columns. Images always fill left to right, then top to bottom.'}),
+                'smart_ratio': ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides the shape picklist when filled, except force_rows / force_cols, which take priority.'}),
+                'forced_N': ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1, 'tooltip': 'Only used when shape is force_rows or force_cols. force_rows: number of rows in the output (columns are worked out from it). force_cols: number of columns in the output (rows are worked out from it). Fill order stays left to right, then top to bottom, so 14 images with 3 rows or 5 columns give the same 3x5 grid. Capped at the image count. With force_rows, if the exact row count would leave an empty row, the closest row count without one is used.'}),
                 'resize_any': ('BOOLEAN', {'default': True, 'tooltip': 'ON: normalize image sizes before stitching. OFF: place at native sizes.'}),
                 'size_guide': (['largest', 'smallest'], {'default': 'largest', 'tooltip': 'Target size when resize_any is ON: match largest or smallest image.'}),
                 'size_method': (['pad small dim', 'stretch', 'crop_center', 'crop large dim'], {'default': 'pad small dim', 'tooltip': 'pad small dim: letterbox, fill leftover with bg. stretch: distort to fit. crop_center: scale-to-fill, crop center. crop large dim: scale-to-fill, large axis overflows/clips.'}),
@@ -341,7 +362,7 @@ class ImageArray:
     OUTPUT_IS_LIST = (False, True)
     FUNCTION = 'create_array'
     CATEGORY = 'Image Label Tools'
-    DESCRIPTION = "Creates an array of images with optional labels in various layouts"
+    DESCRIPTION = "Creates an array of images with optional labels in various layouts. Use shape force_rows / force_cols with forced_N to fix the number of rows or columns."
     
     def parse_labels(self, labels_text, label_input=None):
         """Parse labels from either input or text widget"""
@@ -686,8 +707,10 @@ class ImageArray:
             
             return padded
     
-    def calculate_grid_dimensions(self, num_images, shape, cell_width=None, cell_height=None, smart_ratio=None):
+    def calculate_grid_dimensions(self, num_images, shape, cell_width=None, cell_height=None, smart_ratio=None, forced_N=1):
         """Calculate grid rows and columns based on shape"""
+        if shape in ('force_rows', 'force_cols'):
+            return _forced_grid(num_images, shape, forced_N)
         # If a custom ratio is provided, treat as smart search regardless of shape picklist
         parsed_ratio = _parse_ratio(smart_ratio) if smart_ratio else None
         if parsed_ratio is not None:
@@ -814,13 +837,14 @@ class ImageArray:
         
         return 1, num_images
     
-    def create_array(self, images, background, shape, smart_ratio, resize_any, size_guide, size_method, 
+    def create_array(self, images, background, shape, smart_ratio, forced_N, resize_any, size_guide, size_method, 
                     labels, label_end, label_location, label_size, font, spacing, label_input=None):
         """Create array of labeled images"""
         # Extract parameters from lists
         background = background[0] if isinstance(background, list) else background
         shape = shape[0] if isinstance(shape, list) else shape
         smart_ratio = smart_ratio[0] if isinstance(smart_ratio, list) else smart_ratio
+        forced_N = forced_N[0] if isinstance(forced_N, list) else forced_N
         resize_any = resize_any[0] if isinstance(resize_any, list) else resize_any
         size_guide = size_guide[0] if isinstance(size_guide, list) else size_guide
         size_method = size_method[0] if isinstance(size_method, list) else size_method
@@ -959,7 +983,7 @@ class ImageArray:
         cell_height = max(labeled_heights)
     
         # Calculate grid dimensions using cell dimensions for smart layouts
-        rows, cols = self.calculate_grid_dimensions(num_images, shape, cell_width, cell_height)
+        rows, cols = self.calculate_grid_dimensions(num_images, shape, cell_width, cell_height, smart_ratio=smart_ratio, forced_N=forced_N)
     
         # STEP 6: Create array canvas
         if shape in ['horizontal', 'vertical']:
@@ -1587,10 +1611,13 @@ class AdvancedStitcher:
                                    {'default': 'white on black'}),
                 # ---- layout options ----
                 'shape':          (['horizontal', 'vertical', 'square',
-                                    'smart_square', 'smart_landscape', 'smart_portrait'],
+                                    'smart_square', 'smart_landscape', 'smart_portrait',
+                                    'force_rows', 'force_cols'],
                                    {'default': 'horizontal',
-                                    'tooltip': 'Grid layout for each stitched group.'}),
-                'smart_ratio':    ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides shape picklist when filled.'}),
+                                    'tooltip': 'Grid layout for each stitched group. horizontal: 1 row. vertical: 1 column. square: closest to square. smart_square / smart_landscape (3:2) / smart_portrait (2:3): pick the grid whose overall canvas shape is closest to the target. force_rows: output has forced_N rows. force_cols: output has forced_N columns. Images always fill left to right, then top to bottom.'}),
+                'smart_ratio':    ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides the shape picklist when filled, except force_rows / force_cols, which take priority.'}),
+                'forced_N':       ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1,
+                                    'tooltip': 'Only used when shape is force_rows or force_cols. force_rows: number of rows in each stitched group (columns are worked out from it). force_cols: number of columns in each stitched group (rows are worked out from it). Fill order stays left to right, then top to bottom, so 14 images with 3 rows or 5 columns give the same 3x5 grid. Capped at the image count. With force_rows, if the exact row count would leave an empty row, the closest row count without one is used.'}),
                 'background':     (['black', 'white'], {'default': 'black',
                                     'tooltip': 'Canvas fill color.'}),
                 'resize_any':     ('BOOLEAN', {'default': True,
@@ -1793,8 +1820,10 @@ class AdvancedStitcher:
             padded.paste(r, ((tw - nw) // 2, (th - nh) // 2))
             return padded
 
-    def _calc_grid(self, n, shape, cw=None, ch=None, smart_ratio=None):
+    def _calc_grid(self, n, shape, cw=None, ch=None, smart_ratio=None, forced_N=1):
         """Mirrors ImageArray.calculate_grid_dimensions."""
+        if shape in ('force_rows', 'force_cols'):
+            return _forced_grid(n, shape, forced_N)
         parsed_ratio = _parse_ratio(smart_ratio) if smart_ratio else None
         if parsed_ratio is None:
             if shape == 'horizontal':   return 1, n
@@ -1852,7 +1881,7 @@ class AdvancedStitcher:
     def _stitch_group(self, group_images, label_list, label_end,
                       label_location, label_size, font,
                       bg_color, label_bg, text_color, spacing_color,
-                      size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=None):
+                      size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=None, forced_N=1):
         """
         Takes a list of PIL images (None = filler), labels them, and stitches
         into a single PIL image using the same pipeline as ImageArray.
@@ -1943,7 +1972,7 @@ class AdvancedStitcher:
         # --- grid layout ---
         cw = max(img.width  for img in labeled)
         ch = max(img.height for img in labeled)
-        rows, cols = self._calc_grid(len(labeled), shape, cw, ch, smart_ratio=smart_ratio)
+        rows, cols = self._calc_grid(len(labeled), shape, cw, ch, smart_ratio=smart_ratio, forced_N=forced_N)
 
         # Use variable-size canvas when images may have different sizes:
         # - resize_any is off (native sizes), OR pad_axis restricts one axis
@@ -1984,7 +2013,7 @@ class AdvancedStitcher:
 
     def stitch(self, images, N, group_mode, labels, label_end,
                label_location, label_size, font, label_style,
-               shape, smart_ratio, background, resize_any, size_guide, size_method, pad_axis, spacing,
+               shape, smart_ratio, forced_N, background, resize_any, size_guide, size_method, pad_axis, spacing,
                label_input=None):
 
         # Unwrap list-wrapped scalars (INPUT_IS_LIST=True)
@@ -1999,6 +2028,7 @@ class AdvancedStitcher:
         label_style    = uw(label_style)
         shape          = uw(shape)
         smart_ratio    = uw(smart_ratio)
+        forced_N       = uw(forced_N)
         background     = uw(background)
         size_method    = uw(size_method)
         do_pad         = uw(resize_any)
@@ -2045,7 +2075,7 @@ class AdvancedStitcher:
                 group, label_list, label_end,
                 label_location, label_size, font,
                 bg_color, label_bg, text_color, spacing_color,
-                size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=smart_ratio)
+                size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=smart_ratio, forced_N=forced_N)
             if stitched is None:
                 continue
             arr = np.array(stitched).astype(np.float32) / 255.0

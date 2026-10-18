@@ -78,7 +78,10 @@ Creates organized grids/arrays of images with optional text labels. Images are f
   - `smart_square` - Optimizes for 1:1 aspect ratio considering image dimensions
   - `smart_landscape` - Optimizes for 3:2 aspect ratio considering image dimensions
   - `smart_portrait` - Optimizes for 2:3 aspect ratio considering image dimensions
-- `smart_ratio` - Custom W:H target for smart layout. When filled, overrides the shape picklist and runs the grid search against this ratio. Accepts `16:9`, `16/9`, `1.78`, `3x1`, `3W x 1H`, etc. Leave blank to use the shape picklist.
+  - `force_rows` - Output has exactly `forced_N` rows; columns are worked out from the image count (see `forced_N`)
+  - `force_cols` - Output has exactly `forced_N` columns; rows are worked out from the image count (see `forced_N`)
+- `smart_ratio` - Custom W:H target for smart layout. When filled, overrides the shape picklist and runs the grid search against this ratio. Accepts `16:9`, `16/9`, `1.78`, `3x1`, `3W x 1H`, etc. Leave blank to use the shape picklist. `force_rows` / `force_cols` take priority over `smart_ratio`.
+- `forced_N` - Only used when `shape` is `force_rows` or `force_cols` (default 1). Sets the number of rows or columns in the output. Fill order never changes: images always fill left to right, then top to bottom, so 14 images with `force_rows` = 3 or `force_cols` = 5 give the same 3×5 grid. Capped at the image count. With `force_rows`, if the exact row count can't be reached without an empty row (for example 14 images with 6 rows), the closest row count without one is used (5 rows).
 - `resize_any` - ON: normalize image sizes before arranging. OFF: place at native sizes (boolean)
 - `size_guide` - Target size when `resize_any` is ON: `largest` or `smallest` image in the group
 - `size_method` - How to transform each image to the target size. Will only come into play if you have different sized inputs.
@@ -177,8 +180,9 @@ Splits an image list into groups, stitches each group into a labeled grid, and r
 - `label_style` - Color scheme (same 4 options as Label Image; default `white on black`)
 
 **Layout & Sizing:**
-- `shape` - Grid layout for each stitched group (same options as Image Array; default `horizontal`)
-- `smart_ratio` - Custom W:H target, same format as Image Array
+- `shape` - Grid layout for each stitched group (same options as Image Array, including `force_rows` / `force_cols`; default `horizontal`)
+- `smart_ratio` - Custom W:H target, same format as Image Array (`force_rows` / `force_cols` take priority)
+- `forced_N` - Same as Image Array; sets the rows or columns of each stitched group when `shape` is `force_rows` or `force_cols` (default 1)
 - `background` - Canvas fill color (`black` / `white`)
 - `resize_any` - ON: normalize sizes before stitching. OFF: place at native sizes
 - `size_guide` - `largest` or `smallest` target when `resize_any` is ON
@@ -223,6 +227,7 @@ Eventually...
 - Use `left_vert` or `right_vert` for space-efficient labeling
 - For dynamic labels, connect output from other nodes like counters or text processors
 - `smart_ratio` accepts most common formats: `16:9`, `16/9`, `1.78`, `3x1`, `3W x 1H`
+- Use `force_cols` with `forced_N` for a fixed-width grid of any length (for example 4 columns), or `force_rows` for a fixed-height grid
 
 **Advanced Stitcher:**
 - Use `every_N` grouping to compare corresponding frames across N different generation runs side by side
