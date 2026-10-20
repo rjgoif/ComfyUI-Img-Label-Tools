@@ -30,6 +30,16 @@ import random
 MAX_RESOLUTION = 16384
 
 
+def _match_index(count, match_n):
+    """
+    Convert a 1-based match_N into a 0-based list index.
+    If match_N is larger than the number of items, the last item is used
+    (so a large value like 9999 always means the last one).
+    """
+    count = max(1, int(count))
+    return max(1, min(int(match_n), count)) - 1
+
+
 class ImageEqualizer:
     """
     Equalizes image sizes in a batch through padding and/or scaling.
@@ -42,35 +52,41 @@ class ImageEqualizer:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "size_mode": (["grow", "shrink"], {"default": "grow"}),
-                "upscale_method": (cls.upscale_methods, {"default": "lanczos"}),
-                "keep_proportion": (["pad", "stretch", "resize", "crop", "total_pixels"], {"default": "pad"}),
-                "pad_color": (["black", "white", "gray", "average", "average_edge"], {"default": "black"}),
-                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center"}),
+                "images": ("IMAGE", {"tooltip": "Images to bring to a common size. Every image from every connected batch or list is treated as one set, in input order."}),
+                "size_mode": (["grow", "shrink", "match"], {"default": "grow", "tooltip": "grow: all images match the largest width and height. shrink: all images match the smallest width and height. match: all images match the size of image number match_N (counting from 1, in input order)."}),
+                "match_N": ("INT", {"default": 1, "min": 1, "max": 9999, "step": 1, "tooltip": "Only used when size_mode is match. Which image (counting from 1, in input order) sets the target size. If there are fewer images than this number, the last image is used, so a large value such as 9999 always means the last image."}),
+                "upscale_method": (cls.upscale_methods, {"default": "lanczos", "tooltip": "Resampling method used whenever an image is resized."}),
+                "keep_proportion": (["pad", "stretch", "resize", "crop", "total_pixels"], {"default": "pad", "tooltip": "How each image is fitted to the target size. pad: scale to fit inside the target, then add padding to reach the exact size. stretch: resize to the exact size, ignoring aspect ratio. resize: scale to fit inside the target with no padding (output sizes can differ). crop: scale to fill the target and cut off the overflow. total_pixels: scale each image, keeping its own aspect ratio, to the same total pixel count as the target (output sizes can differ)."}),
+                "pad_color": (["black", "white", "gray", "average", "average_edge"], {"default": "black", "tooltip": "Padding color. Only used when keep_proportion is pad. black, white, gray: solid colors. average: gamma-corrected average color of the resized image. average_edge: gamma-corrected average color of the outer 5% border of the resized image."}),
+                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center", "tooltip": "pad: where the image sits inside the padded frame (the padding goes on the opposite side). crop: which part of the image is kept. top and bottom only matter when height is padded or cropped, left and right only when width is. center splits evenly. Ignored by stretch, resize and total_pixels."}),
             }
         }
     
     RETURN_TYPES = ("IMAGE",)
     INPUT_IS_LIST = True
     OUTPUT_IS_LIST = (True,)
+    OUTPUT_TOOLTIPS = ("The resized images as a list, in input order. With keep_proportion resize or total_pixels the sizes can differ.",)
     FUNCTION = "equalize"
     CATEGORY = "Image Label Tools"
     DESCRIPTION = """
-Resizes images to match the largest or smallest image among them.
+Resizes images to match the largest image, the smallest image, or a chosen image among them.
 
 size_mode determines target dimensions:
 - grow: all images match the largest dimensions
 - shrink: all images match the smallest dimensions
+- match: all images match the dimensions of image number match_N (counting from 1).
+  If there are fewer images than match_N, the last image is used (9999 always means the last image).
 
-keep_proportion maintains aspect ratio by highest dimension:
-- pad: adds padding to fit target size (default)
-- stretch: directly resizes to target
-- resize: scales to fit within target
-- crop: crops to fill target
-- total_pixels: maintains total pixel count
+keep_proportion decides how each image is fitted to the target size:
+- pad: scales to fit inside the target, then pads to the exact size (default)
+- stretch: resizes to the exact size, ignoring aspect ratio
+- resize: scales to fit inside the target with no padding (sizes can differ)
+- crop: scales to fill the target and cuts off the overflow
+- total_pixels: scales each image to the target total pixel count, keeping its own aspect ratio (sizes can differ)
 
-pad_color options:
+crop_position sets where a padded image sits, or which part of a cropped image is kept.
+
+pad_color options (only used with pad):
 - black: RGB(0,0,0)
 - white: RGB(255,255,255)  
 - gray: RGB(128,128,128)
@@ -78,11 +94,12 @@ pad_color options:
 - average_edge: weighted mean of peripheral 5% of pixels
 """
 
-    def equalize(self, images, size_mode, upscale_method, keep_proportion, pad_color, crop_position):
+    def equalize(self, images, size_mode, match_N, upscale_method, keep_proportion, pad_color, crop_position):
         from comfy.utils import common_upscale
         
         # When INPUT_IS_LIST=True, all parameters come as lists - extract the first value
         size_mode = size_mode[0] if isinstance(size_mode, list) else size_mode
+        match_N = match_N[0] if isinstance(match_N, list) else match_N
         upscale_method = upscale_method[0] if isinstance(upscale_method, list) else upscale_method
         keep_proportion = keep_proportion[0] if isinstance(keep_proportion, list) else keep_proportion
         pad_color = pad_color[0] if isinstance(pad_color, list) else pad_color
@@ -106,16 +123,22 @@ pad_color options:
         target_height = all_images[0].shape[1]
         target_width = all_images[0].shape[2]
         
-        for img in all_images:
-            h, w = img.shape[1], img.shape[2]
-            if size_mode == "grow":
-                target_height = max(target_height, h)
-                target_width = max(target_width, w)
-            else:  # shrink
-                target_height = min(target_height, h)
-                target_width = min(target_width, w)
+        if size_mode == "match":
+            # Use image number match_N (1-based); if fewer images than match_N, use the last one
+            ref = all_images[_match_index(num_images, match_N)]
+            target_height = ref.shape[1]
+            target_width = ref.shape[2]
+        else:
+            for img in all_images:
+                h, w = img.shape[1], img.shape[2]
+                if size_mode == "grow":
+                    target_height = max(target_height, h)
+                    target_width = max(target_width, w)
+                else:  # shrink
+                    target_height = min(target_height, h)
+                    target_width = min(target_width, w)
         
-        print(f"Image Equalizer: {num_images} images | {size_mode} to {target_width}x{target_height} | method: {keep_proportion}")
+        print(f"Image Equalizer: {num_images} images | {size_mode}" + (f" (image {_match_index(num_images, match_N) + 1})" if size_mode == "match" else "") + f" to {target_width}x{target_height} | method: {keep_proportion}")
         
         # Process each image
         processed = []
@@ -337,32 +360,37 @@ class ImageArray:
         
         return {
             'required': {
-                'images': ('IMAGE',),
-                'background': (['white', 'black'], {'default': 'white'}),
+                'images': ('IMAGE', {'tooltip': 'Images to arrange. Every image from every connected batch or list is used, in input order.'}),
+                'background': (['white', 'black'], {'default': 'white', 'tooltip': 'Canvas color. Also used for the gaps from spacing and for padding added by size_method. Label boxes use the opposite color, with their text in the background color.'}),
                 'shape': (['horizontal', 'vertical', 'square', 'smart_square', 'smart_landscape', 'smart_portrait', 'force_rows', 'force_cols'], {'default': 'horizontal', 'tooltip': 'Grid layout. horizontal: 1 row. vertical: 1 column. square: closest to square. smart_square / smart_landscape (3:2) / smart_portrait (2:3): pick the grid whose overall canvas shape is closest to the target. force_rows: output has forced_N rows. force_cols: output has forced_N columns. Images always fill left to right, then top to bottom.'}),
                 'smart_ratio': ('STRING', {'default': '', 'tooltip': 'Custom W:H target for smart layout. Accepts 16:9, 16/9, 1.78, 3Wx1H, etc. Overrides the shape picklist when filled, except force_rows / force_cols, which take priority.'}),
                 'forced_N': ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1, 'tooltip': 'Only used when shape is force_rows or force_cols. force_rows: number of rows in the output (columns are worked out from it). force_cols: number of columns in the output (rows are worked out from it). Fill order stays left to right, then top to bottom, so 14 images with 3 rows or 5 columns give the same 3x5 grid. Capped at the image count. With force_rows, if the exact row count would leave an empty row, the closest row count without one is used.'}),
-                'resize_any': ('BOOLEAN', {'default': True, 'tooltip': 'ON: normalize image sizes before stitching. OFF: place at native sizes.'}),
-                'size_guide': (['largest', 'smallest'], {'default': 'largest', 'tooltip': 'Target size when resize_any is ON: match largest or smallest image.'}),
-                'size_method': (['pad small dim', 'stretch', 'crop_center', 'crop large dim'], {'default': 'pad small dim', 'tooltip': 'pad small dim: letterbox, fill leftover with bg. stretch: distort to fit. crop_center: scale-to-fill, crop center. crop large dim: scale-to-fill, large axis overflows/clips.'}),
-                'labels': ('STRING', {'multiline': True, 'default': ''}),
-                'label_end': (['loop', 'end'], {'default': 'loop'}),
-                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
-                'label_size': ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1}),
-                'font': (cls.font_files, {'default': font_default}),
-                'spacing': ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1}),
+                'resize_any': ('BOOLEAN', {'default': True, 'tooltip': 'ON: resize all images to one common size (see size_guide and size_method) before arranging. OFF: keep native sizes; each grid cell is as large as the largest image and smaller images are centered in it.'}),
+                'size_guide': (['largest', 'smallest', 'match'], {'default': 'largest', 'tooltip': 'Target size when resize_any is ON. largest / smallest: match the largest or smallest image. match: match the size of image number match_N. Ignored when resize_any is OFF.'}),
+                'match_N': ('INT', {'default': 1, 'min': 1, 'max': 9999, 'step': 1, 'tooltip': 'Only used when size_guide is match. Which image (counting from 1, in input order) sets the target size. If there are fewer images than this number, the last image is used, so a large value such as 9999 always means the last image.'}),
+                'size_method': (['pad small dim', 'stretch', 'crop_center', 'crop large dim'], {'default': 'pad small dim', 'tooltip': 'How each image is fitted to the target size when resize_any is ON. pad small dim: scale to fit inside the target and fill the rest with the background color. stretch: resize to the exact target size, ignoring aspect ratio. crop_center: scale to fill the target, then cut the overflow equally from both sides. crop large dim: scale to fit inside the target with no padding and no cropping (one side matches the target and the other is smaller, so image sizes can differ).'}),
+                'labels': ('STRING', {'multiline': True, 'default': '', 'tooltip': 'One label per image, in order. Put each label on its own line (press Enter) or separate labels with semicolons. Type \\n inside a label for a line break within that label. Ignored if label_input is connected.'}),
+                'label_end': (['loop', 'end'], {'default': 'loop', 'tooltip': 'What happens when there are more images than labels. loop: start over from the first label. end: images after the last label get a blank label (the label space is still reserved).'}),
+                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom', 'tooltip': 'Where each label goes relative to its image. top, bottom: text above or below. left_hor, right_hor: horizontal text beside the image. left_vert, right_vert: rotated text beside the image. Every image gets the same amount of label space (sized for the longest label), so cells stay aligned.'}),
+                'label_size': ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1, 'tooltip': 'Label font size in pixels. 0 turns labels off completely (no label space is added).'}),
+                'font': (cls.font_files, {'default': font_default, 'tooltip': 'Label font. Lists the files in the fonts folder of your ComfyUI install. Without that folder, Arial is used. If the font cannot be loaded, a small built-in font is used and label_size has no effect.'}),
+                'spacing': ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1, 'tooltip': 'Gap in pixels added around every image (after its label), filled with the background color. The gap between two neighbors is double this value.'}),
             },
             'optional': {
-                'label_input': ('STRING', {'forceInput': True}),
+                'label_input': ('STRING', {'forceInput': True, 'tooltip': 'Optional text input. When connected, it replaces the labels box. Accepts a string, a number, or a list of them (one label per image).'}),
             }
         }
     
     RETURN_TYPES = ('IMAGE', 'IMAGE')
     RETURN_NAMES = ('array', 'images')
+    OUTPUT_TOOLTIPS = (
+        'The finished grid as one image.',
+        'Each image after resizing and labeling (before spacing is added), as a list.',
+    )
     OUTPUT_IS_LIST = (False, True)
     FUNCTION = 'create_array'
     CATEGORY = 'Image Label Tools'
-    DESCRIPTION = "Creates an array of images with optional labels in various layouts. Use shape force_rows / force_cols with forced_N to fix the number of rows or columns."
+    DESCRIPTION = "Arranges images in a grid with optional labels. Images are resized to a common size, labeled, then placed left to right, then top to bottom. Outputs the finished grid and the individual labeled images."
     
     def parse_labels(self, labels_text, label_input=None):
         """Parse labels from either input or text widget"""
@@ -837,7 +865,7 @@ class ImageArray:
         
         return 1, num_images
     
-    def create_array(self, images, background, shape, smart_ratio, forced_N, resize_any, size_guide, size_method, 
+    def create_array(self, images, background, shape, smart_ratio, forced_N, resize_any, size_guide, match_N, size_method, 
                     labels, label_end, label_location, label_size, font, spacing, label_input=None):
         """Create array of labeled images"""
         # Extract parameters from lists
@@ -847,6 +875,7 @@ class ImageArray:
         forced_N = forced_N[0] if isinstance(forced_N, list) else forced_N
         resize_any = resize_any[0] if isinstance(resize_any, list) else resize_any
         size_guide = size_guide[0] if isinstance(size_guide, list) else size_guide
+        match_N = match_N[0] if isinstance(match_N, list) else match_N
         size_method = size_method[0] if isinstance(size_method, list) else size_method
         labels = labels[0] if isinstance(labels, list) else labels
         label_end = label_end[0] if isinstance(label_end, list) else label_end
@@ -892,6 +921,11 @@ class ImageArray:
         if size_guide == 'largest':
             target_width = max(widths)
             target_height = max(heights)
+        elif size_guide == 'match':
+            # image number match_N (1-based); if fewer images than match_N, use the last one
+            ref_idx = _match_index(num_images, match_N)
+            target_width = widths[ref_idx]
+            target_height = heights[ref_idx]
         else:  # smallest
             target_width = min(widths)
             target_height = min(heights)
@@ -1031,36 +1065,47 @@ class RandomSubset:
             "required": {
                 "input_text": ("STRING", {
                     "multiline": True,
-                    "default": ""
+                    "default": "",
+                    "tooltip": "The items to choose from, one per line. Blank lines are ignored."
                 }),
                 "num_to_pick": ("INT", {
                     "default": 1,
                     "min": 1,
-                    "step": 1
+                    "step": 1,
+                    "tooltip": "How many items to pick. Without replacement this is capped at the number of items."
                 }),
                 "with_replacement": ("BOOLEAN", {
-                    "default": False
+                    "default": False,
+                    "tooltip": "ON: the same item can be picked more than once, and num_to_pick is not capped. OFF: each item is picked at most once."
                 }),
                 "random_order": ("BOOLEAN", {
-                    "default": True
+                    "default": True,
+                    "tooltip": "ON: shuffle the picked items one more time before output. OFF: skip that extra shuffle and output them in the order they were drawn. This is not the original list order, except when every item is picked."
                 }),
                 "string_delimiter": ("STRING", {
-                    "default": "\\n"
+                    "default": "\\n",
+                    "tooltip": "Text placed between items in merged_string. Type \\n for a new line."
                 }),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 0xffffffffffffffff
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed. The same seed and settings always give the same picks."
                 })
             }
         }
     
     RETURN_TYPES = ("STRING", "STRING", "INT")
     RETURN_NAMES = ("string_list", "merged_string", "pick_indices")
+    OUTPUT_TOOLTIPS = (
+        "The picked items as a list, one entry per item.",
+        "All picked items joined into one string with string_delimiter.",
+        "Position of each picked item in the input list, counting from 0 (blank lines are not counted).",
+    )
     OUTPUT_IS_LIST = (True, False, True)
     FUNCTION = "select_subset"
     CATEGORY = "Image Label Tools"
-    DESCRIPTION = "Selects a random subset of newline-delimited strings."
+    DESCRIPTION = "Picks a random subset of the lines in input_text. Outputs the picks as a list, as one merged string, and as their positions in the input."
     
     def select_subset(self, input_text, num_to_pick, with_replacement, random_order, 
                      string_delimiter, seed):
@@ -1256,27 +1301,31 @@ class DuckDuckGoImageSearch:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "query":          ("STRING", {"multiline": True, "default": ""}),
-                "start":          ("INT",    {"default": 0,  "min": 0,   "step": 1}),
-                "num_results":    ("INT",    {"default": 1,  "min": 1,   "step": 1}),
-                "output_type":    (["list", "batch"],),
-                "region":         (cls.REGIONS,     {"default": "no region"}),
-                "safe_search":    (cls.SAFE_SEARCH,  {"default": "moderate"}),
-                "size":           (cls.SIZES,        {"default": "all"}),
-                "color":          (cls.COLORS,       {"default": "all"}),
-                "type_image":     (cls.TYPES,        {"default": "all"}),
-                "layout":         (cls.LAYOUTS,      {"default": "all"}),
-                "license_image":  (cls.LICENSES,     {"default": "all"}),
-                "ai_images":      (cls.AI_IMAGES,    {"default": "hide"}),
+                "query":          ("STRING", {"multiline": True, "default": "", "tooltip": "Search text sent to DuckDuckGo image search."}),
+                "start":          ("INT",    {"default": 0,  "min": 0,   "step": 1, "tooltip": "How many results to skip from the top (0 starts at the first result)."}),
+                "num_results":    ("INT",    {"default": 1,  "min": 1,   "step": 1, "tooltip": "How many results to return, counted after skipping start."}),
+                "output_type":    (["list", "batch"], {"tooltip": "list: each image is returned separately at its own size. batch: all images are padded with black to the largest width and height and returned as one batch."}),
+                "region":         (cls.REGIONS,     {"default": "no region", "tooltip": "Search region and language, for example us-en. Currently has no effect: the search call only sends the query text."}),
+                "safe_search":    (cls.SAFE_SEARCH,  {"default": "moderate", "tooltip": "Safe search level: on, moderate or off. Currently has no effect: the search call only sends the query text."}),
+                "size":           (cls.SIZES,        {"default": "all", "tooltip": "Image size filter. Currently has no effect: the search call only sends the query text."}),
+                "color":          (cls.COLORS,       {"default": "all", "tooltip": "Image color filter. Currently has no effect: the search call only sends the query text."}),
+                "type_image":     (cls.TYPES,        {"default": "all", "tooltip": "Image type filter, such as photo, clipart or gif. Currently has no effect: the search call only sends the query text."}),
+                "layout":         (cls.LAYOUTS,      {"default": "all", "tooltip": "Shape filter: Square, Tall or Wide. Currently has no effect: the search call only sends the query text."}),
+                "license_image":  (cls.LICENSES,     {"default": "all", "tooltip": "Usage license filter. Currently has no effect: the search call only sends the query text."}),
+                "ai_images":      (cls.AI_IMAGES,    {"default": "hide", "tooltip": "Intended to hide or show AI-generated images. Currently has no effect: the search call only sends the query text."}),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image(s)", "url(s)")
+    OUTPUT_TOOLTIPS = (
+        "The downloaded images. An image that fails to download becomes a 64x64 black placeholder so positions still match url(s).",
+        "Source URL of each image, in the same order.",
+    )
     OUTPUT_IS_LIST = (False, True)
     FUNCTION = "search"
     CATEGORY = "Image Label Tools"
-    DESCRIPTION = "Fetches images from DuckDuckGo image search by query."
+    DESCRIPTION = "Fetches images from DuckDuckGo image search. Needs: pip install duckduckgo-search requests. Only query, start, num_results and output_type are used right now; the filter widgets are not applied yet."
 
     def search(self, query, start, num_results, output_type,
                region, safe_search, size, color, type_image,
@@ -1384,23 +1433,24 @@ class LabelImage:
 
         return {
             'required': {
-                'image':          ('IMAGE',),
-                'label':          ('STRING', {'multiline': True, 'default': ''}),
-                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom'}),
-                'label_size':     ('INT', {'default': 32, 'min': 1, 'max': 200, 'step': 1}),
-                'font':           (cls.font_files, {'default': font_default}),
-                'label_style':    (['black on white', 'white on black', 'white on dark gray', 'black on light gray'], {'default': 'white on black'}),
+                'image':          ('IMAGE', {'tooltip': 'Image to label. If a batch is connected, every frame gets the same label.'}),
+                'label':          ('STRING', {'multiline': True, 'default': '', 'tooltip': 'Label text. Press Enter for a new line. Ignored if label_input is connected.'}),
+                'label_location': (['top', 'bottom', 'left_vert', 'left_hor', 'right_vert', 'right_hor'], {'default': 'bottom', 'tooltip': 'Where the label goes relative to the image. top, bottom: text above or below. left_hor, right_hor: horizontal text beside the image. left_vert, right_vert: rotated text beside the image.'}),
+                'label_size':     ('INT', {'default': 32, 'min': 1, 'max': 200, 'step': 1, 'tooltip': 'Label font size in pixels.'}),
+                'font':           (cls.font_files, {'default': font_default, 'tooltip': 'Label font. Lists the files in the fonts folder of your ComfyUI install. Without that folder, Arial is used. If the font cannot be loaded, a small built-in font is used and label_size has no effect.'}),
+                'label_style':    (['black on white', 'white on black', 'white on dark gray', 'black on light gray'], {'default': 'white on black', 'tooltip': 'Label colors. The first color is the text and the second is the label box (white on black is white text on a black box).'}),
             },
             'optional': {
-                'label_input': ('STRING', {'forceInput': True}),
+                'label_input': ('STRING', {'forceInput': True, 'tooltip': 'Optional text input. When connected, it replaces the label box.'}),
             }
         }
 
     RETURN_TYPES = ('IMAGE',)
     RETURN_NAMES = ('image',)
+    OUTPUT_TOOLTIPS = ('The image with its label added. The image gets larger to make room for the label.',)
     FUNCTION = 'label_image'
     CATEGORY = 'Image Label Tools'
-    DESCRIPTION = "Adds a text label to a single image. Label text can be typed or connected from another node."
+    DESCRIPTION = "Adds a text label to an image. The label text can be typed in or connected from another node."
 
     # ------------------------------------------------------------------ helpers
     # Re-use the same helpers as ImageArray (they are standalone methods so we
@@ -1596,19 +1646,27 @@ class AdvancedStitcher:
 
         return {
             'required': {
-                'images':         ('IMAGE',),
-                'N':              ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1}),
-                'group_mode':     (['every_N', 'length_N'], {'default': 'every_N'}),
+                'images':         ('IMAGE', {'tooltip': 'Images to group and stitch. Every image from every connected batch or list is used, in input order.'}),
+                'N':              ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1,
+                                    'tooltip': 'Meaning depends on group_mode. every_N: the number of groups (one stitched image per group). length_N: the number of images in each group.'}),
+                'group_mode':     (['every_N', 'length_N'], {'default': 'every_N',
+                                    'tooltip': 'every_N: interleaved groups. Group k holds images k, k+N, k+2N and so on (12 images with N=3 gives [0,3,6,9], [1,4,7,10], [2,5,8,11]). length_N: consecutive chunks of N images ([0,1,2], [3,4,5], ...). In both modes a short group is filled out with blank slots.'}),
                 # ---- label options ----
-                'labels':         ('STRING', {'multiline': True, 'default': ''}),
-                'label_end':      (['blank', 'repeat_last'], {'default': 'blank'}),
+                'labels':         ('STRING', {'multiline': True, 'default': '',
+                                    'tooltip': 'Labels for the slots in each group, in order. One per line (press Enter) or separated by semicolons; type \\n inside a label for a line break. The list restarts for every group. Ignored if label_input is connected.'}),
+                'label_end':      (['blank', 'repeat_last'], {'default': 'blank',
+                                    'tooltip': 'What happens when a group has more slots than labels. blank: the extra slots get empty labels. repeat_last: the extra slots repeat the final label.'}),
                 'label_location': (['top', 'bottom', 'left_vert', 'left_hor',
-                                    'right_vert', 'right_hor'], {'default': 'bottom'}),
-                'label_size':     ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1}),
-                'font':           (cls.font_files, {'default': font_default}),
+                                    'right_vert', 'right_hor'], {'default': 'bottom',
+                                    'tooltip': 'Where each label goes relative to its image. top, bottom: text above or below. left_hor, right_hor: horizontal text beside the image. left_vert, right_vert: rotated text beside the image. Every image gets the same amount of label space (sized for the longest label), so cells stay aligned.'}),
+                'label_size':     ('INT', {'default': 32, 'min': 0, 'max': 200, 'step': 1,
+                                    'tooltip': 'Label font size in pixels. 0 turns labels off completely (no label space is added).'}),
+                'font':           (cls.font_files, {'default': font_default,
+                                    'tooltip': 'Label font. Lists the files in the fonts folder of your ComfyUI install. Without that folder, Arial is used. If the font cannot be loaded, a small built-in font is used and label_size has no effect.'}),
                 'label_style':    (['white on black', 'black on white',
                                     'white on dark gray', 'black on light gray'],
-                                   {'default': 'white on black'}),
+                                   {'default': 'white on black',
+                                    'tooltip': 'Label colors. The first color is the text and the second is the label box (white on black is white text on a black box).'}),
                 # ---- layout options ----
                 'shape':          (['horizontal', 'vertical', 'square',
                                     'smart_square', 'smart_landscape', 'smart_portrait',
@@ -1619,31 +1677,35 @@ class AdvancedStitcher:
                 'forced_N':       ('INT', {'default': 1, 'min': 1, 'max': 256, 'step': 1,
                                     'tooltip': 'Only used when shape is force_rows or force_cols. force_rows: number of rows in each stitched group (columns are worked out from it). force_cols: number of columns in each stitched group (rows are worked out from it). Fill order stays left to right, then top to bottom, so 14 images with 3 rows or 5 columns give the same 3x5 grid. Capped at the image count. With force_rows, if the exact row count would leave an empty row, the closest row count without one is used.'}),
                 'background':     (['black', 'white'], {'default': 'black',
-                                    'tooltip': 'Canvas fill color.'}),
+                                    'tooltip': 'Canvas color. Also used for blank filler slots, for padding added by size_method, and for the gaps from spacing.'}),
                 'resize_any':     ('BOOLEAN', {'default': True,
-                                    'tooltip': 'ON: normalize image sizes before stitching. OFF: place at native sizes.'}),
-                'size_guide':     (['largest', 'smallest'], {'default': 'largest',
-                                    'tooltip': 'Target size when resize_any is ON: match largest or smallest image.'}),
+                                    'tooltip': 'ON: resize the images in each group to one common size (see size_guide, size_method and pad_axis) before stitching. OFF: keep native sizes.'}),
+                'size_guide':     (['largest', 'smallest', 'match'], {'default': 'largest',
+                                    'tooltip': 'Target size when resize_any is ON. largest / smallest: match the largest or smallest image in each group. match: match the size of image number match_N in each group. Ignored when resize_any is OFF.'}),
+                'match_N':        ('INT', {'default': 1, 'min': 1, 'max': 9999, 'step': 1,
+                                    'tooltip': 'Only used when size_guide is match. Which image in each group (counting from 1, in group order) sets the target size. If a group has fewer images than this number, the last image in that group is used, so a large value such as 9999 always means the last image.'}),
                 'size_method':    (['pad small dim', 'stretch', 'crop_center', 'crop large dim'],
                                    {'default': 'pad small dim',
-                                    'tooltip': 'pad small dim: letterbox, fill leftover with bg. stretch: distort to fit. crop_center: scale-to-fill, crop center. crop large dim: scale-to-fill, large axis overflows/clips.'}),
+                                    'tooltip': 'How each image is fitted to the target size when resize_any is ON. pad small dim: scale to fit inside the target and fill the rest with the background color. stretch: resize to the exact target size, ignoring aspect ratio. crop_center: scale to fill the target, then cut the overflow equally from both sides. crop large dim: scale to fit inside the target with no padding and no cropping (one side matches the target and the other is smaller, so image sizes can differ).'}),
                 'pad_axis':       (['both', 'height_only', 'width_only'], {'default': 'both',
-                                    'tooltip': 'Which axis to normalize. height_only: same height, widths vary (good for horizontal). width_only: same width, heights vary (good for vertical).'}),
+                                    'tooltip': 'Only used when resize_any is ON. Which dimension is made equal across each group. both: same width and height. height_only: same height, each image keeps its own width (good for horizontal rows). width_only: same width, each image keeps its own height (good for vertical columns).'}),
                 'spacing':        ('INT', {'default': 5, 'min': 0, 'max': 100, 'step': 1,
-                                    'tooltip': 'Background-color border around each image (px).'}),
+                                    'tooltip': 'Gap in pixels added around every image (after its label), filled with the background color. The gap between two neighbors is double this value.'}),
             },
             'optional': {
-                'label_input': ('STRING', {'forceInput': True}),
+                'label_input': ('STRING', {'forceInput': True,
+                                    'tooltip': 'Optional text input. When connected, it replaces the labels box. Accepts a string or a list of them (one label per slot in each group).'}),
             }
         }
 
     RETURN_TYPES  = ('IMAGE',)
     RETURN_NAMES  = ('stitched_groups',)
+    OUTPUT_TOOLTIPS = ('One stitched image per group, as a list.',)
     OUTPUT_IS_LIST = (True,)
     FUNCTION      = 'stitch'
     CATEGORY      = 'Image Label Tools'
-    DESCRIPTION   = ("Splits an image list into N groups (interleaved or chunked), "
-                     "labels and stitches each group, and returns them as a list of images.")
+    DESCRIPTION   = ("Splits an image list into groups (interleaved with every_N, or consecutive chunks with length_N), "
+                     "labels and stitches each group into a grid, and returns the stitched images as a list.")
 
     # ------------------------------------------------------------------ helpers (mirrors ImageArray)
 
@@ -1881,7 +1943,7 @@ class AdvancedStitcher:
     def _stitch_group(self, group_images, label_list, label_end,
                       label_location, label_size, font,
                       bg_color, label_bg, text_color, spacing_color,
-                      size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=None, forced_N=1):
+                      size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=None, forced_N=1, match_N=1):
         """
         Takes a list of PIL images (None = filler), labels them, and stitches
         into a single PIL image using the same pipeline as ImageArray.
@@ -1917,6 +1979,12 @@ class AdvancedStitcher:
         heights = [img.height for img in pil_imgs]
         if size_guide == 'largest':
             tw, th = max(widths), max(heights)
+        elif size_guide == 'match':
+            # image number match_N within this group (1-based); blank filler slots are skipped,
+            # so if the group has fewer real images than match_N the last real image is used
+            real_imgs = [img for img in group_images if img is not None]
+            ref = real_imgs[_match_index(len(real_imgs), match_N)]
+            tw, th = ref.width, ref.height
         else:
             tw, th = min(widths), min(heights)
 
@@ -2013,7 +2081,7 @@ class AdvancedStitcher:
 
     def stitch(self, images, N, group_mode, labels, label_end,
                label_location, label_size, font, label_style,
-               shape, smart_ratio, forced_N, background, resize_any, size_guide, size_method, pad_axis, spacing,
+               shape, smart_ratio, forced_N, background, resize_any, size_guide, match_N, size_method, pad_axis, spacing,
                label_input=None):
 
         # Unwrap list-wrapped scalars (INPUT_IS_LIST=True)
@@ -2033,6 +2101,7 @@ class AdvancedStitcher:
         size_method    = uw(size_method)
         do_pad         = uw(resize_any)
         size_guide     = uw(size_guide)
+        match_N        = uw(match_N)
         pad_axis       = uw(pad_axis)
         spacing_val    = uw(spacing)
         self._spacing  = spacing_val  # stored for _stitch_group access
@@ -2075,7 +2144,7 @@ class AdvancedStitcher:
                 group, label_list, label_end,
                 label_location, label_size, font,
                 bg_color, label_bg, text_color, spacing_color,
-                size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=smart_ratio, forced_N=forced_N)
+                size_guide, size_method, do_pad, pad_axis, shape, smart_ratio=smart_ratio, forced_N=forced_N, match_N=match_N)
             if stitched is None:
                 continue
             arr = np.array(stitched).astype(np.float32) / 255.0
@@ -2119,20 +2188,30 @@ class LoadImagesFromFolder:
             "required": {
                 "folder": ("STRING", {"default": "", "tooltip": "Root folder to search for images."}),
                 "filter": ("STRING", {"default": "", "tooltip": "Text (or regex pattern) to match against filenames. Leave blank to match all supported image types: png, jpg, jpeg, gif, tiff, tif, webp, bmp."}),
-                "filter_type": (cls.FILTER_TYPES, {"default": "contains", "tooltip": "How 'filter' is matched against the filename."}),
+                "filter_type": (cls.FILTER_TYPES, {"default": "contains", "tooltip": "How filter is matched against the file name. contains, starts with, ends with: plain text match. regex: a regular expression searched anywhere in the name (an invalid pattern matches nothing)."}),
                 "filter_case_sensitive": ("BOOLEAN", {"default": False, "tooltip": "Whether the filter match is case sensitive."}),
                 "filter_include_extension": ("BOOLEAN", {"default": False, "tooltip": "If true, match the filter against the filename including its extension. If false, only the name without extension is matched."}),
-                "every_n": ("INT", {"default": 1, "min": 1, "tooltip": "Keep every Nth image from the filtered/select-sorted pool. 1 = every image, 2 = every other, 3 = every third, etc."}),
+                "every_n": ("INT", {"default": 1, "min": 1, "tooltip": "Keep every Nth image from the filtered and sorted pool, starting with the first. 1 = every image, 2 = every other image, 3 = every third image, and so on."}),
                 "limit": ("INT", {"default": 0, "min": 0, "tooltip": "Max number of images to keep after every_n stepping. 0 = no limit."}),
                 "select_sort": (cls.SELECT_SORT_OPTIONS, {"default": "name ascending", "tooltip": "Order the filtered pool is sorted into BEFORE every_n/limit are applied. 'random' uses seed."}),
                 "output_sort": (cls.OUTPUT_SORT_OPTIONS, {"default": "none", "tooltip": "Order applied to the final selected images for output. 'none' preserves the order they came out of the every_n/limit step. 'random' uses seed."}),
                 "subdirectories": ("BOOLEAN", {"default": False, "tooltip": "Whether to search subdirectories of folder."}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "Seed used whenever select_sort or output_sort is set to 'random'."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "Random seed. Only used when select_sort or output_sort is set to random. The same seed gives the same order."}),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "STRING", "INT", "INT")
     RETURN_NAMES = ("images", "file_paths", "filenames", "filenames_no_ext", "subdirs", "directory", "filtered_count", "output_count")
+    OUTPUT_TOOLTIPS = (
+        "The loaded images as a list (each can be a different size). If nothing is found, a single 1x1 black image.",
+        "Full path of each loaded image.",
+        "File name of each loaded image, with extension.",
+        "File name of each loaded image, without extension.",
+        "Folder of each image relative to the root folder, written with backslashes. A lone backslash means directly in the root folder.",
+        "Full folder path of each image (root folder plus subdirs), ending with a backslash, without the file name.",
+        "How many files matched the filter, before every_n and limit are applied.",
+        "How many images were actually loaded.",
+    )
     OUTPUT_IS_LIST = (True, True, True, True, True, True, False, False)
     FUNCTION = "load_images"
     CATEGORY = "Image Label Tools"
@@ -2146,7 +2225,7 @@ select_sort orders the filtered pool BEFORE every_n stepping and limit are appli
 output_sort re-orders the final selected images for output ('none' = selection order).
 
 subdirs gives each image's folder path relative to root, as a backslash-wrapped
-segment: "\" for files directly in root, "\vacation\" for a subfolder. directory
+segment: "\\" for files directly in root, "\\vacation\\" for a subfolder. directory
 is the full folder path (root + subdirs) with a terminal backslash, no filename.
 Concatenating root + subdirs + filename (or just using directory + filename)
 reconstructs the full path, e.g. "C:\\pics" + "\\vacation\\" + "0001.jpg".
